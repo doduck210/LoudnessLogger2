@@ -1,0 +1,25 @@
+CXX ?= g++
+
+TARGET := decklink_pcm_recorder
+
+DECKLINK_DIR := third_party/decklink
+RECORDER_SOURCES := \
+	src/main.cpp \
+	src/WavSegmentWriter.cpp \
+	$(DECKLINK_DIR)/src/DeckLinkAPIDispatch.cpp
+HEADERS := $(wildcard include/*.h $(DECKLINK_DIR)/include/*.h)
+
+CPPFLAGS += -Iinclude -I$(DECKLINK_DIR)/include
+CXXFLAGS ?= -O2
+CXXFLAGS += -std=c++17 -Wall -Wextra -Wpedantic -Wno-multichar
+LDLIBS += -ldl -pthread
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(RECORDER_SOURCES) $(HEADERS)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(RECORDER_SOURCES) -o $@ $(LDFLAGS) $(LDLIBS)
+
+clean:
+	rm -f $(TARGET)

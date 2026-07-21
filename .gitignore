@@ -1,0 +1,21 @@
+# Local Blackmagic DeckLink SDK files
+/third_party/decklink/
+
+# Compiled program and C/C++ build products
+/decklink_pcm_recorder
+*.o
+*.a
+*.so
+*.so.*
+
+# Captured audio
+/recordings/
+*.wav
+*.pcm
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
