@@ -12,6 +12,7 @@
 /recordings/
 *.wav
 *.pcm
+*_mlkfs*.csv
 
 # Editor and operating-system files
 .vscode/

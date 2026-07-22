@@ -9,14 +9,22 @@
 
 - DeckLink SDK에서 48 kHz 인터리브 PCM을 직접 받는다.
 - SDK 콜백에서는 PCM 복사만 하고 파일 쓰기는 별도 thread가 수행한다.
-- 로컬 서버 시각 기준으로 WAV를 분할한다.
+- 같은 writer thread에서 연속 K-weighting과 M-LKFS 계산을 수행한다. 기본 필터는
+  과거 pyloudnorm 기본값과 같은 RBJ이며 `--lkfs-filter deman`도 선택할 수 있다.
+- M-LKFS는 게이팅하지 않은 400 ms 창을 서울 시각 100 ms 격자마다 계산한다.
+  결과는 서울 정시 기준 한 시간 단위 `*_mlkfs.csv`에 `double` 정밀도로 저장한다.
+- 프로세스 시작 직후에는 다음 100 ms 경계 전까지의 최대 4,800 sample frame을
+  버리고 시간축을 정확한 `.0`/`.1` 격자에 맞춘다. 이후 정시 파일의 첫 M 블록은
+  항상 `HH:00:00.0`에서 시작한다.
+- 서버 timezone 설정과 관계없이 서울 시각(KST, UTC+09:00) 기준으로 WAV 파일명을
+  만들고 정시 경계에서 분할한다.
 - 녹음 형식은 SDI audio 1·2번 채널, 48 kHz, signed 32-bit little-endian PCM이다.
 - 파일 이름과 시간 단위 분할 방식은 기존 logger와 호환된다.
   - `YYYY-MM-DD_HH.00.00.wav` (정시에 시작된 segment)
   - 프로세스가 시각 중간에 시작되면 첫 파일은 실제 시작 초를 사용한다.
 - DeckLink packet time이 건너뛰거나 writer queue가 넘치면 그 구간을 무음으로
   채워 이후 오디오와 wall clock의 대응이 밀리지 않게 한다. 로그와 종료 통계에
-  누락량을 남긴다.
+  누락량을 남긴다. 삽입된 무음은 WAV와 M-LKFS 계산에 똑같이 적용된다.
 - WAV 헤더를 5초마다 갱신하므로 비정상 종료 파일도 대부분 복구 없이 읽을 수 있다.
 - 같은 파일명이 이미 있으면 덮어쓰지 않고 `_partNN` suffix를 붙인다.
 - Audio packet이 5초 동안 도착하지 않으면 경고하고, 단절이 계속되면 30초마다
@@ -53,12 +61,27 @@ SDI audio 1·2번 채널을 32-bit PCM으로 한 시간 단위 녹음:
 ./decklink_pcm_recorder \
   --device 0 \
   --output /mnt/raid/recording/SBS_HD \
-  --segment-minutes 60
+  --segment-minutes 60 \
+  --lkfs-filter rbj
 ```
 
 2채널/48 kHz/32-bit PCM은 시간당 약 1.38 GB, 하루 약 33.2 GB다. 한 시간 파일이
 일반 RIFF/WAV의 4 GiB 한계보다 충분히 작으므로 60분 단위 저장이 가능하다.
 채널 수와 sample depth는 실행 옵션이 아니라 프로그램 설정으로 고정되어 있다.
+
+M-LKFS CSV는 WAV segment 길이와 관계없이 한 시간 단위다. 프로세스 시작 후 첫
+부분 파일은 WAV처럼 실제 시작 시각을 사용하고, 그다음부터 서울 정시에 분할한다.
+한 시간에 36,000개 값이 기록되며 크기는 대략 4 MB다. 파일명과 열은 다음과 같다.
+
+```text
+2026-07-22_12.00.00_mlkfs.csv
+
+start_time_kst,end_time_kst,start_sample,end_sample,mlkfs,filter
+2026-07-22T12:00:00.0+09:00,2026-07-22T12:00:00.4+09:00,0,19200,-23.035004560596764,RBJ
+```
+
+같은 시간대 파일이 이미 있으면 WAV와 마찬가지로 `_partNN`을 붙이며 덮어쓰지 않는다.
+CSV는 5초마다 flush한다. `--lkfs-filter`를 생략하면 `rbj`이고 `deman`도 가능하다.
 
 `--mode`를 생략하면 1080i59.94를 초기 mode로 사용하고, 지원 장치에서는 입력
 format detection을 켠다. 자동 감지가 불가능한 장치에서는 `--list-modes`로 확인한
@@ -73,8 +96,7 @@ index를 `--mode INDEX`로 지정한다.
 - `dropped_frames`, `inserted_silence_frames`, `Writer failure` 로그
 - mount 상태, 남은 disk 공간, inode
 - DeckLink driver/firmware version과 SDI signal 유무
-- 서버 timezone 및 NTP 동기화
+- 서버 시스템 시각의 NTP 동기화
 
-다음 구현 단계는 파일 이름만 비교하지 않고 각 WAV의 실제 시작 시각과 sample
-offset으로 편성 구간을 자르는 C++ cutter, BS.1770 loudness 계산, XLSX/CSV report
-생성 순서가 적합하다.
+다음 구현 단계는 편성표 구간에 완전히 포함되는 M-LKFS 블록을 CSV에서 모아
+absolute/relative gating으로 I-LKFS를 계산하고 XLSX/CSV report를 생성하는 것이다.

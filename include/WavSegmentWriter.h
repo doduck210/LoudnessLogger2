@@ -1,5 +1,7 @@
 #pragma once
 
+#include "LKFS.h"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -22,6 +24,8 @@ public:
         std::uint32_t segmentMinutes = 60;
         std::size_t maxQueueBytes = 64U * 1024U * 1024U;
         std::chrono::seconds headerCheckpointInterval{5};
+        loudness::LKFS::FilterType loudnessFilter =
+            loudness::LKFS::FilterType::Rbj;
     };
 
     struct Stats {

@@ -70,6 +70,8 @@ struct Options {
     std::string outputDirectory = "./recordings";
     std::uint32_t segmentMinutes = 60;
     std::size_t queueMiB = 64;
+    loudness::LKFS::FilterType loudnessFilter =
+        loudness::LKFS::FilterType::Rbj;
     bool listDevices = false;
     bool listModes = false;
     bool showHelp = false;
@@ -85,6 +87,18 @@ unsigned long parseUnsigned(const char* text, const char* optionName) {
     return result;
 }
 
+loudness::LKFS::FilterType parseLoudnessFilter(const char* text) {
+    const std::string value(text);
+    if (value == "rbj") {
+        return loudness::LKFS::FilterType::Rbj;
+    }
+    if (value == "deman") {
+        return loudness::LKFS::FilterType::DeMan;
+    }
+    throw std::invalid_argument(
+        "Invalid value for --lkfs-filter: " + value + " (use rbj or deman)");
+}
+
 void printUsage(const char* program) {
     std::cout
         << "Usage: " << program << " [options]\n\n"
@@ -93,6 +107,7 @@ void printUsage(const char* program) {
         << "  -o, --output DIRECTORY      WAV output directory (default: ./recordings)\n"
         << "  -s, --segment-minutes N     Local-clock aligned segment length (default: 60)\n"
         << "  -q, --queue-mib N           Writer queue capacity (default: 64 MiB)\n"
+        << "      --lkfs-filter NAME      Loudness filter: rbj or deman (default: rbj)\n"
         << "      --list-devices          List capture-capable DeckLink devices\n"
         << "      --list-modes            List modes for the selected device\n"
         << "  -h, --help                  Show this help\n\n"
@@ -109,6 +124,7 @@ Options parseOptions(int argc, char** argv) {
         {"output", required_argument, nullptr, 'o'},
         {"segment-minutes", required_argument, nullptr, 's'},
         {"queue-mib", required_argument, nullptr, 'q'},
+        {"lkfs-filter", required_argument, nullptr, 1002},
         {"list-devices", no_argument, nullptr, 1000},
         {"list-modes", no_argument, nullptr, 1001},
         {"help", no_argument, nullptr, 'h'},
@@ -128,6 +144,7 @@ Options parseOptions(int argc, char** argv) {
             case 'q': options.queueMiB = static_cast<std::size_t>(parseUnsigned(optarg, "--queue-mib")); break;
             case 1000: options.listDevices = true; break;
             case 1001: options.listModes = true; break;
+            case 1002: options.loudnessFilter = parseLoudnessFilter(optarg); break;
             case 'h': options.showHelp = true; break;
             default: throw std::invalid_argument("Invalid command-line option");
         }
@@ -416,6 +433,7 @@ int run(const Options& options) {
     writerConfig.bitsPerSample = kAudioBitsPerSample;
     writerConfig.segmentMinutes = options.segmentMinutes;
     writerConfig.maxQueueBytes = options.queueMiB * 1024U * 1024U;
+    writerConfig.loudnessFilter = options.loudnessFilter;
 
     std::string validationError;
     if (!WavSegmentWriter::validateConfig(writerConfig, validationError)) {
@@ -492,6 +510,10 @@ int run(const Options& options) {
 
     std::cout << "Recording SDI channels 1-2, 48 kHz, 32-bit PCM to "
               << options.outputDirectory << '\n'
+              << "Writing hourly M-LKFS CSV logs using "
+              << (options.loudnessFilter == loudness::LKFS::FilterType::Rbj
+                      ? "RBJ" : "DeMan")
+              << " K-weighting\n"
               << "Press Ctrl+C to stop.\n";
 
     std::uint64_t previousDropped = 0;

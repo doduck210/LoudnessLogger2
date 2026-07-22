@@ -16,6 +16,7 @@ namespace {
 
 constexpr std::uint64_t kMaxWaveDataBytes =
     static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) - 36U;
+constexpr std::int64_t kSeoulUtcOffsetSeconds = 9LL * 60LL * 60LL;
 
 void writeLe16(std::ostream& output, std::uint16_t value) {
     const std::array<char, 2> bytes{
@@ -35,31 +36,99 @@ void writeLe32(std::ostream& output, std::uint32_t value) {
     output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
-std::tm localTime(std::time_t value) {
+std::tm seoulTime(std::time_t utcTime) {
+    const std::time_t shiftedTime = utcTime + kSeoulUtcOffsetSeconds;
     std::tm result{};
-    localtime_r(&value, &result);
+    gmtime_r(&shiftedTime, &result);
     return result;
 }
 
 std::string timestampForFilename(std::chrono::system_clock::time_point time) {
     const std::time_t raw = std::chrono::system_clock::to_time_t(time);
-    const std::tm local = localTime(raw);
+    const std::tm seoul = seoulTime(raw);
     std::ostringstream output;
-    output << std::put_time(&local, "%Y-%m-%d_%H.%M.%S");
+    output << std::put_time(&seoul, "%Y-%m-%d_%H.%M.%S");
     return output.str();
 }
 
-std::chrono::system_clock::time_point nextLocalBoundary(
+std::string timestampForCsv(std::chrono::system_clock::time_point time) {
+    const auto sinceEpoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        time.time_since_epoch());
+    std::int64_t seconds =
+        std::chrono::duration_cast<std::chrono::seconds>(sinceEpoch).count();
+    std::int64_t nanoseconds =
+        (sinceEpoch - std::chrono::seconds{seconds}).count();
+    if (nanoseconds < 0) {
+        --seconds;
+        nanoseconds += 1000000000LL;
+    }
+
+    const std::tm seoul = seoulTime(static_cast<std::time_t>(seconds));
+    std::ostringstream output;
+    const std::int64_t tenths = nanoseconds / 100000000LL;
+    output << std::put_time(&seoul, "%Y-%m-%dT%H:%M:%S")
+           << '.' << tenths
+           << "+09:00";
+    return output.str();
+}
+
+std::chrono::system_clock::time_point seoulBoundaryAtOrBefore(
     std::chrono::system_clock::time_point time,
     std::uint32_t segmentMinutes) {
-    std::time_t raw = std::chrono::system_clock::to_time_t(time);
-    std::tm local = localTime(raw);
-    const int currentBucket = local.tm_min / static_cast<int>(segmentMinutes);
-    local.tm_min = (currentBucket + 1) * static_cast<int>(segmentMinutes);
-    local.tm_sec = 0;
-    local.tm_isdst = -1;
-    raw = std::mktime(&local);
-    return std::chrono::system_clock::from_time_t(raw);
+    const std::int64_t utcSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            time.time_since_epoch()).count();
+    const std::int64_t localSeconds = utcSeconds + kSeoulUtcOffsetSeconds;
+    const std::int64_t segmentSeconds =
+        static_cast<std::int64_t>(segmentMinutes) * 60LL;
+    const std::int64_t boundaryLocalSeconds =
+        (localSeconds / segmentSeconds) * segmentSeconds;
+    return std::chrono::system_clock::time_point{
+        std::chrono::seconds{boundaryLocalSeconds - kSeoulUtcOffsetSeconds}};
+}
+
+std::chrono::system_clock::time_point nextLoudnessGridPoint(
+    std::chrono::system_clock::time_point time) {
+    constexpr std::int64_t kGridNanoseconds = 100000000LL;
+    const std::int64_t nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            time.time_since_epoch()).count();
+    const std::int64_t alignedNanoseconds =
+        ((nanoseconds + kGridNanoseconds - 1LL) / kGridNanoseconds) *
+        kGridNanoseconds;
+    return std::chrono::system_clock::time_point{
+        std::chrono::nanoseconds{alignedNanoseconds}};
+}
+
+std::int64_t framesToReach(
+    std::chrono::system_clock::time_point from,
+    std::chrono::system_clock::time_point to,
+    std::uint32_t sampleRate) {
+    const std::int64_t nanoseconds =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
+    if (nanoseconds <= 0) {
+        return 0;
+    }
+    constexpr std::int64_t kNanosecondsPerSecond = 1000000000LL;
+    return (nanoseconds * static_cast<std::int64_t>(sampleRate) +
+            kNanosecondsPerSecond - 1LL) / kNanosecondsPerSecond;
+}
+
+std::chrono::system_clock::time_point nextSeoulBoundary(
+    std::chrono::system_clock::time_point time,
+    std::uint32_t segmentMinutes) {
+    const std::int64_t utcSeconds =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            time.time_since_epoch()).count();
+    const std::int64_t localSeconds = utcSeconds + kSeoulUtcOffsetSeconds;
+    const std::int64_t segmentSeconds =
+        static_cast<std::int64_t>(segmentMinutes) * 60LL;
+    const std::int64_t nextLocalSeconds =
+        ((localSeconds / segmentSeconds) + 1LL) * segmentSeconds;
+    const std::int64_t nextUtcSeconds =
+        nextLocalSeconds - kSeoulUtcOffsetSeconds;
+    return std::chrono::system_clock::time_point{
+        std::chrono::seconds{nextUtcSeconds}};
 }
 
 std::filesystem::path uniqueWavPath(const std::filesystem::path& directory,
@@ -80,6 +149,107 @@ std::filesystem::path uniqueWavPath(const std::filesystem::path& directory,
     }
     throw std::runtime_error("Could not choose a unique WAV filename for " + stem);
 }
+
+std::filesystem::path uniqueLoudnessPath(
+    const std::filesystem::path& directory,
+    std::chrono::system_clock::time_point hourStart) {
+    const std::string stem = timestampForFilename(hourStart) + "_mlkfs";
+    std::filesystem::path candidate = directory / (stem + ".csv");
+    if (!std::filesystem::exists(candidate)) {
+        return candidate;
+    }
+
+    for (unsigned int part = 1; part < 10000; ++part) {
+        std::ostringstream name;
+        name << stem << "_part" << std::setw(2) << std::setfill('0') << part
+             << ".csv";
+        candidate = directory / name.str();
+        if (!std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+    throw std::runtime_error("Could not choose a unique loudness filename for " + stem);
+}
+
+const char* loudnessFilterName(loudness::LKFS::FilterType filterType) {
+    return filterType == loudness::LKFS::FilterType::Rbj ? "RBJ" : "DeMan";
+}
+
+class MomentaryCsvFile {
+public:
+    MomentaryCsvFile(const std::filesystem::path& path,
+                     loudness::LKFS::FilterType filterType,
+                     std::chrono::seconds checkpointInterval)
+        : path_(path),
+          filterType_(filterType),
+          checkpointInterval_(checkpointInterval),
+          nextCheckpoint_(std::chrono::steady_clock::now() + checkpointInterval) {
+        output_.open(path_, std::ios::out | std::ios::trunc);
+        if (!output_) {
+            throw std::runtime_error("Could not open loudness log: " + path_.string());
+        }
+        output_ << "start_time_kst,end_time_kst,start_sample,end_sample,mlkfs,filter\n";
+        if (!output_) {
+            throw std::runtime_error("Could not write loudness log header: " +
+                                     path_.string());
+        }
+    }
+
+    ~MomentaryCsvFile() {
+        try {
+            close();
+        } catch (...) {
+        }
+    }
+
+    void write(const loudness::LKFS::MomentaryBlock& block,
+               std::chrono::system_clock::time_point start,
+               std::chrono::system_clock::time_point end) {
+        output_ << timestampForCsv(start) << ','
+                << timestampForCsv(end) << ','
+                << block.startSample << ','
+                << block.endSample << ','
+                << std::setprecision(std::numeric_limits<double>::max_digits10)
+                << block.mlkfs << ','
+                << loudnessFilterName(filterType_) << '\n';
+        if (!output_) {
+            throw std::runtime_error("Failed while writing loudness log: " +
+                                     path_.string());
+        }
+
+        if (std::chrono::steady_clock::now() >= nextCheckpoint_) {
+            checkpoint();
+            nextCheckpoint_ = std::chrono::steady_clock::now() + checkpointInterval_;
+        }
+    }
+
+    void close() {
+        if (!output_.is_open()) {
+            return;
+        }
+        checkpoint();
+        output_.close();
+        if (output_.fail()) {
+            throw std::runtime_error("Failed to close loudness log: " + path_.string());
+        }
+    }
+
+    const std::filesystem::path& path() const { return path_; }
+
+private:
+    void checkpoint() {
+        output_.flush();
+        if (!output_) {
+            throw std::runtime_error("Failed to flush loudness log: " + path_.string());
+        }
+    }
+
+    std::filesystem::path path_;
+    loudness::LKFS::FilterType filterType_;
+    std::chrono::seconds checkpointInterval_;
+    std::chrono::steady_clock::time_point nextCheckpoint_;
+    std::ofstream output_;
+};
 
 class WavFile {
 public:
@@ -374,13 +544,79 @@ void WavSegmentWriter::setFatalError(const std::string& error) {
 void WavSegmentWriter::writerLoop() {
     try {
         std::optional<WavFile> file;
+        std::optional<loudness::LKFS> loudnessMeter;
+        std::optional<MomentaryCsvFile> loudnessFile;
+        std::chrono::system_clock::time_point loudnessFileHour;
+        bool loudnessFileHasBeenOpened = false;
         bool timelineInitialized = false;
         bool sourceClockAvailable = false;
         std::int64_t sourceOrigin = 0;
+        std::int64_t initialDiscardFramesRemaining = 0;
         std::int64_t outputFrame = 0;
         std::chrono::system_clock::time_point wallOrigin;
         std::chrono::system_clock::time_point nextBoundary;
         std::int64_t nextBoundaryFrame = 0;
+
+        auto storeMomentaries = [&](const std::vector<loudness::LKFS::MomentaryBlock>& blocks) {
+            for (const auto& block : blocks) {
+                const auto blockStart = wallOrigin +
+                    durationForFrames(static_cast<std::int64_t>(block.startSample),
+                                      config_.sampleRate);
+                const auto blockEnd = wallOrigin +
+                    durationForFrames(static_cast<std::int64_t>(block.endSample),
+                                      config_.sampleRate);
+                const auto hour = seoulBoundaryAtOrBefore(blockStart, 60);
+                if (!loudnessFile || hour != loudnessFileHour) {
+                    if (loudnessFile) {
+                        std::cerr << "Closing loudness log: "
+                                  << loudnessFile->path() << '\n';
+                        loudnessFile->close();
+                        loudnessFile.reset();
+                    }
+                    // Match the WAV naming rule: the first partial file uses
+                    // its actual start time; later files use exact hour starts.
+                    const auto filenameTime =
+                        loudnessFileHasBeenOpened ? hour : blockStart;
+                    const auto path = uniqueLoudnessPath(
+                        config_.outputDirectory, filenameTime);
+                    loudnessFile.emplace(path, config_.loudnessFilter,
+                                         config_.headerCheckpointInterval);
+                    loudnessFileHour = hour;
+                    loudnessFileHasBeenOpened = true;
+                    std::cerr << "Opening loudness log: " << path << '\n';
+                }
+                loudnessFile->write(block, blockStart, blockEnd);
+            }
+        };
+
+        auto processLoudness = [&](const std::uint8_t* bytes, std::int64_t frames) {
+            if (!loudnessMeter || frames <= 0) {
+                return;
+            }
+            std::vector<loudness::LKFS::MomentaryBlock> blocks;
+            if (config_.bitsPerSample == 32) {
+                blocks = loudnessMeter->processInterleavedInt32Bytes(
+                    bytes,
+                    static_cast<std::size_t>(frames), config_.channels);
+            } else {
+                blocks = loudnessMeter->processInterleavedInt16Bytes(
+                    bytes,
+                    static_cast<std::size_t>(frames), config_.channels);
+            }
+            storeMomentaries(blocks);
+        };
+
+        std::vector<std::uint8_t> loudnessSilence(
+            static_cast<std::size_t>(4096U) * blockAlign_, 0U);
+        auto processSilenceLoudness = [&](std::int64_t frames) {
+            const std::int64_t bufferFrames = static_cast<std::int64_t>(
+                loudnessSilence.size() / blockAlign_);
+            while (frames > 0) {
+                const std::int64_t count = std::min(frames, bufferFrames);
+                processLoudness(loudnessSilence.data(), count);
+                frames -= count;
+            }
+        };
 
         auto openFile = [&](std::chrono::system_clock::time_point start) {
             if (file) {
@@ -397,7 +633,7 @@ void WavSegmentWriter::writerLoop() {
         auto rotateIfNeeded = [&]() {
             while (outputFrame >= nextBoundaryFrame) {
                 openFile(nextBoundary);
-                nextBoundary = nextLocalBoundary(nextBoundary, config_.segmentMinutes);
+                nextBoundary = nextSeoulBoundary(nextBoundary, config_.segmentMinutes);
                 nextBoundaryFrame = framesBetween(wallOrigin, nextBoundary, config_.sampleRate);
             }
         };
@@ -407,6 +643,7 @@ void WavSegmentWriter::writerLoop() {
                 rotateIfNeeded();
                 const std::int64_t count = std::min(frames, nextBoundaryFrame - outputFrame);
                 file->writeSilence(static_cast<std::uint64_t>(count));
+                processSilenceLoudness(count);
                 outputFrame += count;
                 frames -= count;
                 insertedSilentFrames_.fetch_add(static_cast<std::uint64_t>(count));
@@ -419,6 +656,7 @@ void WavSegmentWriter::writerLoop() {
                 rotateIfNeeded();
                 const std::int64_t count = std::min(frames, nextBoundaryFrame - outputFrame);
                 file->write(bytes, static_cast<std::uint64_t>(count));
+                processLoudness(bytes, count);
                 bytes += static_cast<std::size_t>(count) * blockAlign_;
                 outputFrame += count;
                 frames -= count;
@@ -443,15 +681,41 @@ void WavSegmentWriter::writerLoop() {
             }
 
             if (!timelineInitialized) {
-                wallOrigin = chunk.capturedAt -
-                             durationForFrames(chunk.sampleFrames, config_.sampleRate);
+                const auto rawWallOrigin = chunk.capturedAt -
+                    durationForFrames(chunk.sampleFrames, config_.sampleRate);
+                wallOrigin = nextLoudnessGridPoint(rawWallOrigin);
+                const std::int64_t alignmentDiscard =
+                    framesToReach(rawWallOrigin, wallOrigin, config_.sampleRate);
                 sourceClockAvailable = chunk.packetTimeValid;
-                sourceOrigin = chunk.packetTime;
+                sourceOrigin = chunk.packetTime +
+                    (sourceClockAvailable ? alignmentDiscard : 0);
+                initialDiscardFramesRemaining =
+                    sourceClockAvailable ? 0 : alignmentDiscard;
                 outputFrame = 0;
-                nextBoundary = nextLocalBoundary(wallOrigin, config_.segmentMinutes);
+                nextBoundary = nextSeoulBoundary(wallOrigin, config_.segmentMinutes);
                 nextBoundaryFrame = framesBetween(wallOrigin, nextBoundary, config_.sampleRate);
+                loudnessMeter.emplace(
+                    config_.loudnessFilter, 0);
                 openFile(wallOrigin);
                 timelineInitialized = true;
+                if (alignmentDiscard > 0) {
+                    std::cerr << "Aligning recording to the next 100 ms boundary; "
+                              << "discarding " << alignmentDiscard
+                              << " initial sample frames\n";
+                }
+            }
+
+            std::int64_t inputOffset = 0;
+            std::int64_t inputFrames = static_cast<std::int64_t>(chunk.sampleFrames);
+            if (!sourceClockAvailable && initialDiscardFramesRemaining > 0) {
+                const std::int64_t discard =
+                    std::min(initialDiscardFramesRemaining, inputFrames);
+                inputOffset += discard;
+                inputFrames -= discard;
+                initialDiscardFramesRemaining -= discard;
+                if (inputFrames == 0) {
+                    continue;
+                }
             }
 
             std::int64_t targetFrame = outputFrame;
@@ -473,18 +737,23 @@ void WavSegmentWriter::writerLoop() {
                 writeSilence(missing);
             }
 
-            std::int64_t overlap = std::max<std::int64_t>(0, outputFrame - targetFrame);
-            if (overlap >= static_cast<std::int64_t>(chunk.sampleFrames)) {
+            const std::int64_t overlap =
+                std::max<std::int64_t>(0, outputFrame - targetFrame);
+            if (overlap >= inputFrames) {
                 continue;
             }
             const auto* bytes = chunk.bytes.data() +
-                                static_cast<std::size_t>(overlap) * blockAlign_;
-            writeAudio(bytes, static_cast<std::int64_t>(chunk.sampleFrames) - overlap);
+                static_cast<std::size_t>(inputOffset + overlap) * blockAlign_;
+            writeAudio(bytes, inputFrames - overlap);
         }
 
         if (file) {
             std::cerr << "Closing WAV: " << file->path() << '\n';
             file->close();
+        }
+        if (loudnessFile) {
+            std::cerr << "Closing loudness log: " << loudnessFile->path() << '\n';
+            loudnessFile->close();
         }
     } catch (const std::exception& exception) {
         setFatalError(exception.what());
