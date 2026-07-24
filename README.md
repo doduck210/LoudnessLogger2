@@ -98,5 +98,35 @@ index를 `--mode INDEX`로 지정한다.
 - DeckLink driver/firmware version과 SDI signal 유무
 - 서버 시스템 시각의 NTP 동기화
 
-다음 구현 단계는 편성표 구간에 완전히 포함되는 M-LKFS 블록을 CSV에서 모아
-absolute/relative gating으로 I-LKFS를 계산하고 XLSX/CSV report를 생성하는 것이다.
+## Daily loudness report
+
+`loudness_report`는 지정 날짜의 편성표를 내부 API에서 받아 각 편성 구간에 완전히
+포함되는 M-LKFS 블록만 선택한다. 저장된 M 값을 에너지로 복원하고 −70 LKFS
+absolute gate와 −10 LU relative gate를 적용해 I-LKFS를 계산한다.
+CSV 표시 시각의 반올림 오차에 의존하지 않고 `start_sample`/`end_sample`로 100 ms
+블록 시간축을 재구성하므로 기존 장시간 로그도 정확히 처리한다.
+
+```bash
+make
+
+./loudness_report \
+  --date 2026-07-23 \
+  --recordings ./recordings
+```
+
+기본 출력 파일은 `SBS_HD_Loudness_Report_2026-07-23.xlsx`다. `--output`의 확장자를
+`.csv`로 지정하면 CSV 리포트를 생성한다. 계산에 사용한 편성표 API 원문도 리포트와
+같은 디렉터리의 `SBS_HD_Schedule_2026-07-23.json`에 매번 저장한다.
+
+```bash
+./loudness_report \
+  --date 2026-07-23 \
+  --recordings ./recordings \
+  --output reports/SBS_HD_Loudness_Report_2026-07-23.xlsx
+```
+
+기존 파일은 기본적으로 덮어쓰지 않는다. 의도적으로 교체할 때만 `--force`를 쓴다.
+API에 접근할 수 없는 개발 환경에서는 `--schedule-json saved.json`으로 저장된 응답을
+사용할 수 있다. 저장할 편성표 경로는 `--schedule-output FILE`로 변경할 수 있다.
+편성 구간의 400 ms 블록이 하나라도 빠지면 해당 ILKFS 셀은 비우고 프로그램은 경고와
+종료 코드 2를 반환한다.

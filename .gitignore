@@ -3,6 +3,7 @@
 
 # Compiled program and C/C++ build products
 /decklink_pcm_recorder
+/loudness_report
 *.o
 *.a
 *.so
@@ -13,6 +14,7 @@
 *.wav
 *.pcm
 *_mlkfs*.csv
+*_Schedule_*.json
 
 # Editor and operating-system files
 .vscode/

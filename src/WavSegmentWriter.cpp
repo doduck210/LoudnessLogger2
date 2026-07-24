@@ -54,18 +54,14 @@ std::string timestampForFilename(std::chrono::system_clock::time_point time) {
 std::string timestampForCsv(std::chrono::system_clock::time_point time) {
     const auto sinceEpoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
         time.time_since_epoch());
-    std::int64_t seconds =
-        std::chrono::duration_cast<std::chrono::seconds>(sinceEpoch).count();
-    std::int64_t nanoseconds =
-        (sinceEpoch - std::chrono::seconds{seconds}).count();
-    if (nanoseconds < 0) {
-        --seconds;
-        nanoseconds += 1000000000LL;
-    }
-
+    constexpr std::int64_t kNanosecondsPerTenth = 100000000LL;
+    const std::int64_t roundedTenths =
+        (sinceEpoch.count() + kNanosecondsPerTenth / 2LL) /
+        kNanosecondsPerTenth;
+    const std::int64_t seconds = roundedTenths / 10LL;
+    const std::int64_t tenths = roundedTenths % 10LL;
     const std::tm seoul = seoulTime(static_cast<std::time_t>(seconds));
     std::ostringstream output;
-    const std::int64_t tenths = nanoseconds / 100000000LL;
     output << std::put_time(&seoul, "%Y-%m-%dT%H:%M:%S")
            << '.' << tenths
            << "+09:00";
@@ -381,8 +377,18 @@ std::int64_t framesBetween(std::chrono::system_clock::time_point from,
 
 std::chrono::system_clock::duration durationForFrames(std::int64_t frames,
                                                        std::uint32_t sampleRate) {
-    return std::chrono::duration_cast<std::chrono::system_clock::duration>(
-        std::chrono::duration<double>(static_cast<double>(frames) / sampleRate));
+    constexpr std::int64_t kNanosecondsPerSecond = 1000000000LL;
+    const std::int64_t seconds = frames / static_cast<std::int64_t>(sampleRate);
+    const std::int64_t remainder =
+        frames % static_cast<std::int64_t>(sampleRate);
+    const std::int64_t numerator = remainder * kNanosecondsPerSecond;
+    const std::int64_t halfRate = static_cast<std::int64_t>(sampleRate) / 2LL;
+    const std::int64_t nanoseconds =
+        numerator >= 0
+            ? (numerator + halfRate) / static_cast<std::int64_t>(sampleRate)
+            : (numerator - halfRate) / static_cast<std::int64_t>(sampleRate);
+    return std::chrono::seconds{seconds} +
+           std::chrono::nanoseconds{nanoseconds};
 }
 
 }  // namespace
