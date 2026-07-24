@@ -60,10 +60,21 @@ SDI audio 1·2번 채널을 32-bit PCM으로 한 시간 단위 녹음:
 ```bash
 ./decklink_pcm_recorder \
   --device 0 \
-  --output /mnt/raid/recording/SBS_HD \
   --segment-minutes 60 \
   --lkfs-filter rbj
 ```
+
+`--output`을 생략하면 `/mnt/hdd/recordings`에 저장한다. 다른 경로를 사용할 때만
+`--output DIRECTORY`를 지정한다.
+
+C++ 프로그램의 기본 저장 위치를 바꾸려면 `include/Config.h` 상단의 다음 한 줄만
+수정하고 `make`로 다시 빌드한다.
+
+```cpp
+inline const std::filesystem::path kStorageRoot = "/mnt/hdd";
+```
+
+`recordings`, `schedules`, `reports` 하위 경로가 모두 함께 변경된다.
 
 2채널/48 kHz/32-bit PCM은 시간당 약 1.38 GB, 하루 약 33.2 GB다. 한 시간 파일이
 일반 RIFF/WAV의 4 GiB 한계보다 충분히 작으므로 60분 단위 저장이 가능하다.
@@ -89,14 +100,8 @@ index를 `--mode INDEX`로 지정한다.
 
 ## 24/7 service
 
-`decklink-pcm-recorder.service.example`의 사용자, 실행 파일, 저장 경로를 서버에
-맞춘 뒤 systemd unit으로 설치한다. 운영 전 다음을 별도로 감시해야 한다.
-
-- service restart 횟수와 process 생존 여부
-- `dropped_frames`, `inserted_silence_frames`, `Writer failure` 로그
-- mount 상태, 남은 disk 공간, inode
-- DeckLink driver/firmware version과 SDI signal 유무
-- 서버 시스템 시각의 NTP 동기화
+24/7 자동 시작과 재시작을 위한 systemd 등록 방법은
+[`SYSTEMD.md`](SYSTEMD.md)를 참고한다.
 
 ## Daily loudness report
 
@@ -110,19 +115,19 @@ CSV 표시 시각의 반올림 오차에 의존하지 않고 `start_sample`/`end
 make
 
 ./loudness_report \
-  --date 2026-07-23 \
-  --recordings ./recordings
+  --date 2026-07-23
 ```
 
-기본 출력 파일은 `SBS_HD_Loudness_Report_2026-07-23.xlsx`다. `--output`의 확장자를
-`.csv`로 지정하면 CSV 리포트를 생성한다. 계산에 사용한 편성표 API 원문도 리포트와
-같은 디렉터리의 `SBS_HD_Schedule_2026-07-23.json`에 매번 저장한다.
+기본 녹음 경로는 `/mnt/hdd/recordings`, 리포트는
+`/mnt/hdd/reports/SBS_HD_Loudness_Report_2026-07-23.xlsx`, 계산에 사용한 편성표
+원문은 `/mnt/hdd/schedules/SBS_HD_Schedule_2026-07-23.json`이다. `--output`의
+확장자를 `.csv`로 지정하면 CSV 리포트를 생성한다.
 
 ```bash
 ./loudness_report \
   --date 2026-07-23 \
-  --recordings ./recordings \
-  --output reports/SBS_HD_Loudness_Report_2026-07-23.xlsx
+  --recordings /another/recordings \
+  --output /another/reports/SBS_HD_Loudness_Report_2026-07-23.xlsx
 ```
 
 기존 파일은 기본적으로 덮어쓰지 않는다. 의도적으로 교체할 때만 `--force`를 쓴다.
@@ -130,3 +135,28 @@ API에 접근할 수 없는 개발 환경에서는 `--schedule-json saved.json`�
 사용할 수 있다. 저장할 편성표 경로는 `--schedule-output FILE`로 변경할 수 있다.
 편성 구간의 400 ms 블록이 하나라도 빠지면 해당 ILKFS 셀은 비우고 프로그램은 경고와
 종료 코드 2를 반환한다.
+
+## Web console
+
+Node.js 20 이상이 설치되어 있으면 별도 패키지 설치 없이 운영 콘솔을 실행할 수 있다.
+
+```bash
+cd web
+npm start
+```
+
+기본 주소는 `http://127.0.0.1:8080`이다. 편성표는
+`/mnt/hdd/schedules/SBS_HD_Schedule_YYYY-MM-DD.json` 한 파일만 사용한다. 저장된 파일이
+없으면 화면에서 API 편성표를 받아 만들 수 있고, 수정 저장과 API 새로고침은 같은
+파일을 원자적으로 교체한다. 리포트는 `/mnt/hdd/reports/`에 생성된다.
+
+운영 경로와 listen 주소는 환경변수로 변경할 수 있다.
+
+```bash
+LOUDNESS_WEB_HOST=0.0.0.0 \
+LOUDNESS_WEB_PORT=8080 \
+LOUDNESS_RECORDINGS_DIR=/mnt/loudness/recordings \
+LOUDNESS_SCHEDULES_DIR=/mnt/loudness/schedules \
+LOUDNESS_REPORTS_DIR=/mnt/loudness/reports \
+npm start
+```

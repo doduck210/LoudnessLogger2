@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Loudness Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span><span></span>
+          </div>
+          <div>
+            <strong>Loudness</strong>
+            <small>CONTROL ROOM</small>
+          </div>
+        </div>
+        <nav aria-label="주 메뉴">
+          <button class="nav-item active" data-view="dashboard">
+            <span class="nav-icon">◫</span>대시보드
+          </button>
+          <button class="nav-item" data-view="schedule">
+            <span class="nav-icon">≡</span>편성표
+          </button>
+          <button class="nav-item" data-view="reports">
+            <span class="nav-icon">↧</span>리포트
+          </button>
+        </nav>
+        <div class="sidebar-foot">
+          <span class="status-dot"></span>
+          <div><strong>SEOUL / KST</strong><small id="server-time">연결 중</small></div>
+        </div>
+      </aside>
+
+      <main>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">SBS HD · LOUDNESS LOGGER 2</p>
+            <h1 id="page-title">운영 대시보드</h1>
+          </div>
+          <div class="top-actions">
+            <span id="global-message" class="global-message" hidden></span>
+            <button id="refresh-view" class="icon-button" title="새로고침">↻</button>
+          </div>
+        </header>
+
+        <section id="dashboard-view" class="view active">
+          <div class="hero-grid">
+            <article class="hero-card recorder-card">
+              <div class="card-head">
+                <span>DECKLINK INPUT</span>
+                <span id="recorder-badge" class="badge neutral">확인 중</span>
+              </div>
+              <div class="signal">
+                <div class="signal-bars" aria-hidden="true">
+                  <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                </div>
+                <div>
+                  <strong id="recorder-title">입력 상태 확인 중</strong>
+                  <small>48 kHz · Stereo · PCM 32-bit</small>
+                </div>
+              </div>
+              <dl class="metric-list">
+                <div><dt>현재 WAV</dt><dd id="latest-wav">—</dd></div>
+                <div><dt>M-LKFS 로그</dt><dd id="latest-csv">—</dd></div>
+              </dl>
+            </article>
+
+            <article class="hero-card storage-card">
+              <div class="card-head"><span>STORAGE</span><span id="disk-percent">—</span></div>
+              <div class="storage-number"><strong id="disk-free">—</strong><span>사용 가능</span></div>
+              <div class="progress"><span id="disk-progress"></span></div>
+              <div class="storage-meta">
+                <span>전체 <b id="disk-total">—</b></span>
+                <span>예상 <b id="days-left">—</b></span>
+              </div>
+            </article>
+
+            <article class="hero-card daily-card">
+              <div class="card-head"><span>ARCHIVE</span><span>LOCAL</span></div>
+              <div class="archive-counts">
+                <div><strong id="report-count">—</strong><span>리포트</span></div>
+                <div><strong id="schedule-count">—</strong><span>편성표</span></div>
+                <div><strong id="recording-count">—</strong><span>녹음 파일</span></div>
+              </div>
+            </article>
+          </div>
+
+          <div class="section-grid">
+            <article class="panel">
+              <div class="panel-head">
+                <div><p class="eyebrow">QUICK ACTION</p><h2>리포트 생성</h2></div>
+              </div>
+              <div class="quick-report">
+                <label>방송일<input id="dashboard-date" type="date" /></label>
+                <button id="open-schedule" class="button primary">편성표 확인</button>
+              </div>
+              <p class="muted">편성표를 확인하거나 수정한 뒤 약 0.4초 안에 일일 리포트를 생성합니다.</p>
+            </article>
+            <article class="panel">
+              <div class="panel-head">
+                <div><p class="eyebrow">RECENT</p><h2>최근 리포트</h2></div>
+                <button class="text-button" data-view-link="reports">전체 보기</button>
+              </div>
+              <div id="recent-reports" class="file-list empty">리포트가 없습니다.</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="schedule-view" class="view">
+          <div class="toolbar panel">
+            <label>방송일<input id="schedule-date" type="date" /></label>
+            <div class="toolbar-actions">
+              <button id="load-schedule" class="button secondary">편성표 열기</button>
+              <button id="fetch-schedule" class="button ghost">API에서 다시 받기</button>
+              <button id="save-schedule" class="button secondary" disabled>변경 저장</button>
+              <button id="calculate-report" class="button primary" disabled>리포트 재계산</button>
+            </div>
+          </div>
+
+          <div id="schedule-summary" class="summary-strip" hidden>
+            <div><span>편성 수</span><strong id="summary-count">—</strong></div>
+            <div><span>시작</span><strong id="summary-start">—</strong></div>
+            <div><span>종료</span><strong id="summary-end">—</strong></div>
+            <div><span>전체 길이</span><strong id="summary-duration">—</strong></div>
+            <div id="dirty-state" class="save-state saved">저장됨</div>
+          </div>
+
+          <article class="panel schedule-panel">
+            <div class="panel-head">
+              <div><p class="eyebrow">PROGRAM SCHEDULE</p><h2>편성 항목</h2></div>
+              <input id="schedule-filter" class="search" type="search" placeholder="제목 또는 ID 검색" />
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>#</th><th>시작 시각</th><th>길이</th><th>편성명</th><th>프로그램 ID</th><th></th></tr>
+                </thead>
+                <tbody id="schedule-rows">
+                  <tr class="empty-row"><td colspan="6">방송일을 선택하고 편성표를 여세요.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section id="reports-view" class="view">
+          <article class="panel">
+            <div class="panel-head">
+              <div><p class="eyebrow">REPORT ARCHIVE</p><h2>생성된 리포트</h2></div>
+            </div>
+            <div id="report-list" class="report-grid empty">리포트가 없습니다.</div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="job-dialog">
+      <div class="dialog-head">
+        <div><p class="eyebrow">CALCULATION JOB</p><h2 id="job-title">리포트 계산</h2></div>
+        <button id="close-job" class="icon-button">×</button>
+      </div>
+      <div id="job-state" class="job-state running"><span></span>작업 준비 중</div>
+      <pre id="job-log"></pre>
+      <div class="dialog-actions">
+        <button id="download-job-report" class="button primary" hidden>리포트 다운로드</button>
+      </div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

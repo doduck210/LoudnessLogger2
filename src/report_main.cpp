@@ -1,3 +1,4 @@
+#include "Config.h"
 #include "LKFS.h"
 
 #include <algorithm>
@@ -33,7 +34,7 @@ constexpr std::int64_t kSeoulUtcOffsetSeconds = 9LL * 60LL * 60LL;
 
 struct Options {
     std::string date;
-    std::filesystem::path recordingsDirectory = "./recordings";
+    std::filesystem::path recordingsDirectory = config::kRecordingsDirectory;
     std::filesystem::path output;
     std::filesystem::path scheduleJson;
     std::filesystem::path scheduleOutput;
@@ -66,7 +67,8 @@ void printUsage(const char* program) {
     std::cout
         << "Usage: " << program << " --date YYYY-MM-DD [options]\n\n"
         << "  -d, --date DATE              Broadcast schedule date (required)\n"
-        << "  -r, --recordings DIRECTORY   M-LKFS CSV directory (default: ./recordings)\n"
+        << "  -r, --recordings DIRECTORY   M-LKFS CSV directory (default: "
+        << config::kRecordingsDirectory.string() << ")\n"
         << "  -o, --output FILE            Output .xlsx or .csv path\n"
         << "      --channel NAME           Default output prefix (default: SBS_HD)\n"
         << "      --schedule-json FILE     Read saved API JSON instead of HTTP\n"
@@ -77,7 +79,7 @@ void printUsage(const char* program) {
         << "  -h, --help                   Show this help\n\n"
         << "Example:\n"
         << "  " << program
-        << " --date 2026-07-23 --recordings ./recordings\n";
+        << " --date 2026-07-23\n";
 }
 
 Options parseOptions(int argc, char** argv) {
@@ -123,12 +125,14 @@ Options parseOptions(int argc, char** argv) {
         throw std::invalid_argument("--date is required");
     }
     if (!options.showHelp && options.output.empty()) {
-        options.output = options.channelName + "_Loudness_Report_" +
-                         options.date + ".xlsx";
+        options.output =
+            config::kReportsDirectory /
+            (options.channelName + "_Loudness_Report_" +
+             options.date + ".xlsx");
     }
     if (!options.showHelp && options.scheduleOutput.empty()) {
         options.scheduleOutput =
-            options.output.parent_path() /
+            config::kSchedulesDirectory /
             (options.channelName + "_Schedule_" + options.date + ".json");
     }
     return options;

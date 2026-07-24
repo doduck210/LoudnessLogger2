@@ -1,4 +1,5 @@
 #include "DeckLinkAPI.h"
+#include "Config.h"
 #include "WavSegmentWriter.h"
 
 #include <atomic>
@@ -67,7 +68,7 @@ private:
 struct Options {
     int deviceIndex = 0;
     int modeIndex = -1;
-    std::string outputDirectory = "./recordings";
+    std::string outputDirectory = config::kRecordingsDirectory.string();
     std::uint32_t segmentMinutes = 60;
     std::size_t queueMiB = 64;
     loudness::LKFS::FilterType loudnessFilter =
@@ -104,7 +105,8 @@ void printUsage(const char* program) {
         << "Usage: " << program << " [options]\n\n"
         << "  -d, --device INDEX          Capture-capable DeckLink index (default: 0)\n"
         << "  -m, --mode INDEX            Fixed display-mode index (default: auto detect)\n"
-        << "  -o, --output DIRECTORY      WAV output directory (default: ./recordings)\n"
+        << "  -o, --output DIRECTORY      WAV output directory (default: "
+        << config::kRecordingsDirectory.string() << ")\n"
         << "  -s, --segment-minutes N     Local-clock aligned segment length (default: 60)\n"
         << "  -q, --queue-mib N           Writer queue capacity (default: 64 MiB)\n"
         << "      --lkfs-filter NAME      Loudness filter: rbj or deman (default: rbj)\n"
@@ -113,7 +115,7 @@ void printUsage(const char* program) {
         << "  -h, --help                  Show this help\n\n"
         << "Audio format is fixed to SDI channels 1-2, 48 kHz, 32-bit PCM.\n\n"
         << "Example:\n"
-        << "  " << program << " -d 0 -o /mnt/raid/recording/SBS_HD -s 60\n";
+        << "  " << program << " -d 0 -s 60\n";
 }
 
 Options parseOptions(int argc, char** argv) {
@@ -584,6 +586,11 @@ int run(const Options& options) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Keep service logs visible immediately even when stdout is redirected to
+    // logs/recorder.log instead of an interactive terminal.
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
+
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
     std::signal(SIGHUP, handleSignal);

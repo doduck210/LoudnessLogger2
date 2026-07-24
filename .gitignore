@@ -15,6 +15,13 @@
 *.pcm
 *_mlkfs*.csv
 *_Schedule_*.json
+/schedules/
+/reports/
+/web/node_modules/
+
+# Runtime logs
+/logs/*
+!/logs/.gitkeep
 
 # Editor and operating-system files
 .vscode/
