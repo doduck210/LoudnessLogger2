@@ -5,6 +5,9 @@ const state = {
   dirty: false,
   filter: "",
   jobTimer: null,
+  settings: null,
+  channelId: "",
+  reportChannels: [],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -83,25 +86,22 @@ function switchView(view) {
     dashboard: "운영 대시보드",
     schedule: "편성표 관리",
     reports: "Loudness 리포트",
+    settings: "시스템 설정",
   };
   $$(".view").forEach((node) => node.classList.toggle("active", node.id === `${view}-view`));
   $$(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === view));
   $("#page-title").textContent = titles[view];
   if (view === "dashboard") loadDashboard();
   if (view === "reports") loadReports();
+  if (view === "settings") loadSettings();
 }
 
 async function loadDashboard() {
   try {
     const data = await api("/api/dashboard");
     $("#server-time").textContent = data.serverTimeKst;
-    const recording = data.recorder.state === "recording";
-    $("#recorder-badge").textContent = recording ? "RECORDING" : "IDLE";
-    $("#recorder-badge").className = `badge ${recording ? "good" : "neutral"}`;
-    $("#recorder-title").textContent = recording ? "오디오 입력 정상" : "최근 기록 없음";
-    $(".signal-bars").style.opacity = recording ? "1" : ".25";
-    $("#latest-wav").textContent = data.recorder.latestWav?.name || "—";
-    $("#latest-csv").textContent = data.recorder.latestMlkfs?.name || "—";
+    updateReportChannelOptions(data.reportChannels);
+    renderRecorders(data.recorders);
     $("#disk-free").textContent = formatBytes(data.storage.availableBytes);
     $("#disk-total").textContent = formatBytes(data.storage.totalBytes);
     $("#disk-percent").textContent = `${data.storage.usedPercent.toFixed(1)}% USED`;
@@ -114,6 +114,83 @@ async function loadDashboard() {
   } catch (error) {
     notify(error.message, true);
   }
+}
+
+function updateReportChannelOptions(channels) {
+  state.reportChannels = channels;
+  for (const selector of ["#dashboard-channel", "#schedule-channel"]) {
+    const select = $(selector);
+    const current = select.value;
+    select.replaceChildren(
+      ...channels.map((channel) => {
+        const option = document.createElement("option");
+        option.value = channel.id;
+        option.textContent = `${channel.name} · ${channel.scheduleType}`;
+        return option;
+      }),
+    );
+    select.value = channels.some((channel) => channel.id === current)
+      ? current
+      : channels[0]?.id || "";
+  }
+}
+
+function renderRecorders(recorders) {
+  const active = recorders.filter((recorder) => recorder.state === "recording").length;
+  const summary = $("#recorder-summary");
+  summary.textContent = `${active}/${recorders.length} RECORDING`;
+  summary.className = `badge ${
+    active === recorders.length ? "good" : active > 0 ? "neutral" : "danger"
+  }`;
+
+  const rows = recorders.map((recorder) => {
+    const row = document.createElement("div");
+    row.className = "recorder-row";
+
+    const identity = document.createElement("div");
+    identity.className = "recorder-identity";
+    const title = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = recorder.name;
+    const badge = document.createElement("span");
+    const labels = {
+      recording: "RECORDING",
+      idle: "IDLE",
+      unavailable: "ERROR",
+    };
+    badge.textContent = labels[recorder.state] || recorder.state;
+    badge.className = `badge ${
+      recorder.state === "recording"
+        ? "good"
+        : recorder.state === "unavailable"
+          ? "danger"
+          : "neutral"
+    }`;
+    title.append(name, badge);
+    const path = document.createElement("small");
+    path.textContent = recorder.recordingsDirectory;
+    path.title = recorder.recordingsDirectory;
+    identity.append(title, path);
+
+    const files = document.createElement("div");
+    files.className = "recorder-files";
+    const wav = document.createElement("small");
+    wav.textContent = `WAV  ${recorder.latestWav?.name || "—"}`;
+    wav.title = recorder.latestWav?.name || "";
+    const csv = document.createElement("small");
+    csv.textContent =
+      recorder.state === "unavailable"
+        ? recorder.error
+        : `M-LKFS  ${recorder.latestMlkfs?.name || "—"}`;
+    csv.title =
+      recorder.state === "unavailable"
+        ? recorder.error
+        : recorder.latestMlkfs?.name || "";
+    files.append(wav, csv);
+    row.append(identity, files);
+    return row;
+  });
+  $("#recorder-list").replaceChildren(...rows);
 }
 
 function renderFileRows(container, files) {
@@ -145,10 +222,15 @@ function renderFileRows(container, files) {
 
 async function loadSchedule() {
   const date = $("#schedule-date").value;
+  const channelId = $("#schedule-channel").value;
+  if (!channelId) return notify("리포트 채널을 선택하세요.", true);
   if (!date) return notify("방송일을 선택하세요.", true);
   try {
-    const schedule = await api(`/api/schedule?date=${encodeURIComponent(date)}`);
-    setSchedule(date, schedule);
+    const schedule = await api(
+      `/api/schedule?channelId=${encodeURIComponent(channelId)}` +
+        `&date=${encodeURIComponent(date)}`,
+    );
+    setSchedule(channelId, date, schedule);
     notify("저장된 편성표를 열었습니다.");
   } catch (error) {
     if (error.message.includes("없습니다")) {
@@ -162,6 +244,8 @@ async function loadSchedule() {
 
 async function fetchSchedule(requireConfirmation = true) {
   const date = $("#schedule-date").value;
+  const channelId = $("#schedule-channel").value;
+  if (!channelId) return notify("리포트 채널을 선택하세요.", true);
   if (!date) return notify("방송일을 선택하세요.", true);
   if (
     requireConfirmation &&
@@ -172,16 +256,17 @@ async function fetchSchedule(requireConfirmation = true) {
   try {
     const schedule = await api("/api/schedule/fetch", {
       method: "POST",
-      body: JSON.stringify({ date }),
+      body: JSON.stringify({ channelId, date }),
     });
-    setSchedule(date, schedule);
+    setSchedule(channelId, date, schedule);
     notify("API 편성표로 교체했습니다.");
   } catch (error) {
     notify(error.message, true);
   }
 }
 
-function setSchedule(date, schedule) {
+function setSchedule(channelId, date, schedule) {
+  state.channelId = channelId;
   state.date = date;
   state.schedule = schedule;
   state.dirty = false;
@@ -298,12 +383,18 @@ function renderSchedule() {
 }
 
 async function saveSchedule(showMessage = true) {
-  if (!state.schedule || !state.date) throw new Error("열린 편성표가 없습니다.");
+  if (!state.schedule || !state.date || !state.channelId) {
+    throw new Error("열린 편성표가 없습니다.");
+  }
   const schedule = await api("/api/schedule", {
     method: "PUT",
-    body: JSON.stringify({ date: state.date, schedule: state.schedule }),
+    body: JSON.stringify({
+      channelId: state.channelId,
+      date: state.date,
+      schedule: state.schedule,
+    }),
   });
-  setSchedule(state.date, schedule);
+  setSchedule(state.channelId, state.date, schedule);
   if (showMessage) notify("편성표를 저장했습니다.");
 }
 
@@ -312,7 +403,7 @@ async function calculateReport() {
     if (state.dirty) await saveSchedule(false);
     const job = await api("/api/reports", {
       method: "POST",
-      body: JSON.stringify({ date: state.date }),
+      body: JSON.stringify({ channelId: state.channelId, date: state.date }),
     });
     showJob(job);
   } catch (error) {
@@ -322,7 +413,8 @@ async function calculateReport() {
 
 function showJob(job) {
   clearInterval(state.jobTimer);
-  $("#job-title").textContent = `${job.date} 리포트 계산`;
+  $("#job-title").textContent =
+    `${job.date} · ${job.channelName || "기본 채널"} 리포트 계산`;
   $("#job-dialog").showModal();
   updateJobDialog(job);
   state.jobTimer = setInterval(async () => {
@@ -393,6 +485,130 @@ async function loadReports() {
   }
 }
 
+async function loadSettings() {
+  try {
+    state.settings = await api("/api/settings");
+    renderSettings();
+  } catch (error) {
+    notify(error.message, true);
+  }
+}
+
+function renderSettings() {
+  if (!state.settings) return;
+  $("#schedule-api").value = state.settings.scheduleApi || "";
+  const container = $("#channel-settings");
+  const rows = state.settings.channels.map((channel) => {
+    const row = document.createElement("div");
+    row.className = "channel-setting-row";
+
+    const nameLabel = document.createElement("label");
+    nameLabel.textContent = "채널 이름";
+    const name = document.createElement("input");
+    name.value = channel.name;
+    name.maxLength = 80;
+    name.addEventListener("input", () => {
+      channel.name = name.value;
+    });
+    nameLabel.append(name);
+
+    const pathLabel = document.createElement("label");
+    pathLabel.textContent = "녹음 데이터 조회 경로";
+    const path = document.createElement("input");
+    path.value = channel.recordingsDirectory;
+    path.placeholder = "/mnt/hdd/recordings/channel";
+    path.spellcheck = false;
+    path.addEventListener("input", () => {
+      channel.recordingsDirectory = path.value;
+    });
+    pathLabel.append(path);
+
+    const reportLabel = document.createElement("label");
+    reportLabel.textContent = "리포트 대상";
+    const reportBox = document.createElement("div");
+    reportBox.className = "setting-check";
+    const reportEnabled = document.createElement("input");
+    reportEnabled.type = "checkbox";
+    reportEnabled.checked = Boolean(channel.reportEnabled);
+    const reportText = document.createElement("span");
+    reportText.textContent = "계산 사용";
+    reportBox.append(reportEnabled, reportText);
+    reportLabel.append(reportBox);
+
+    const scheduleLabel = document.createElement("label");
+    scheduleLabel.textContent = "편성 종류";
+    const scheduleType = document.createElement("select");
+    for (const type of ["HD", "UHD"]) {
+      const option = document.createElement("option");
+      option.value = type;
+      option.textContent = type;
+      scheduleType.append(option);
+    }
+    scheduleType.value = channel.scheduleType || "HD";
+    scheduleType.disabled = !reportEnabled.checked;
+    reportEnabled.addEventListener("change", () => {
+      channel.reportEnabled = reportEnabled.checked;
+      scheduleType.disabled = !reportEnabled.checked;
+    });
+    scheduleType.addEventListener("change", () => {
+      channel.scheduleType = scheduleType.value;
+    });
+    scheduleLabel.append(scheduleType);
+
+    const remove = document.createElement("button");
+    remove.className = "channel-remove";
+    remove.type = "button";
+    remove.title = "채널 삭제";
+    remove.textContent = "×";
+    remove.disabled = state.settings.channels.length === 1;
+    remove.addEventListener("click", () => {
+      if (!confirm(`${channel.name} 채널을 설정에서 삭제하시겠습니까?`)) return;
+      state.settings.channels = state.settings.channels.filter(
+        (item) => item.id !== channel.id,
+      );
+      renderSettings();
+    });
+
+    row.append(nameLabel, pathLabel, reportLabel, scheduleLabel, remove);
+    return row;
+  });
+  container.replaceChildren(...rows);
+}
+
+function addChannel() {
+  if (!state.settings) return;
+  if (state.settings.channels.length >= 16) {
+    return notify("채널은 최대 16개까지 등록할 수 있습니다.", true);
+  }
+  const id = `channel_${Date.now().toString(36)}`;
+  state.settings.channels.push({
+    id,
+    name: `채널 ${state.settings.channels.length + 1}`,
+    recordingsDirectory: "/mnt/hdd/recordings/",
+    reportEnabled: false,
+    scheduleType: "HD",
+  });
+  renderSettings();
+  const inputs = $$("#channel-settings input");
+  inputs.at(-3)?.focus();
+}
+
+async function saveSettings() {
+  if (!state.settings) return;
+  state.settings.scheduleApi = $("#schedule-api").value.trim();
+  try {
+    state.settings = await api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify(state.settings),
+    });
+    renderSettings();
+    await loadDashboard();
+    notify("채널 설정을 저장했습니다.");
+  } catch (error) {
+    notify(error.message, true);
+  }
+}
+
 $$("[data-view]").forEach((button) =>
   button.addEventListener("click", () => switchView(button.dataset.view)),
 );
@@ -401,6 +617,7 @@ $$("[data-view-link]").forEach((button) =>
 );
 $("#refresh-view").addEventListener("click", () => switchView(state.view));
 $("#open-schedule").addEventListener("click", () => {
+  $("#schedule-channel").value = $("#dashboard-channel").value;
   $("#schedule-date").value = $("#dashboard-date").value;
   switchView("schedule");
   loadSchedule();
@@ -416,6 +633,18 @@ $("#schedule-filter").addEventListener("input", (event) => {
   renderSchedule();
 });
 $("#close-job").addEventListener("click", () => $("#job-dialog").close());
+$("#add-channel").addEventListener("click", addChannel);
+$("#save-settings").addEventListener("click", saveSettings);
+$("#schedule-channel").addEventListener("change", () => {
+  state.schedule = null;
+  state.channelId = "";
+  state.dirty = false;
+  $("#schedule-summary").hidden = true;
+  $("#save-schedule").disabled = true;
+  $("#calculate-report").disabled = true;
+  $("#schedule-rows").innerHTML =
+    '<tr class="empty-row"><td colspan="6">채널과 방송일을 선택하고 편성표를 여세요.</td></tr>';
+});
 
 const defaultDate = yesterdayKst();
 $("#dashboard-date").value = defaultDate;

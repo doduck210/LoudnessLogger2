@@ -31,17 +31,30 @@ mkdir -p /home/duck/Codes/LoudnessLogger2/logs
 
 ## 2. 녹음 서비스 파일 작성
 
-다음 파일을 관리자 권한으로 연다.
+DeckLink 입력 하나마다 서비스를 하나씩 만든다. DeckLink SDK 장치 번호는
+`--list-devices`에 표시되는 0부터 시작하는 번호이므로, 이 서버에서 물리 포트
+2·3·4는 각각 `--device 1`, `--device 2`, `--device 3`이다.
+
+먼저 저장 디렉터리를 만든다.
 
 ```bash
-sudo nano /etc/systemd/system/loudness-recorder.service
+mkdir -p \
+  /mnt/hdd/recordings/decklink2 \
+  /mnt/hdd/recordings/decklink3 \
+  /mnt/hdd/recordings/decklink4
+```
+
+포트 2 서비스 파일을 관리자 권한으로 연다.
+
+```bash
+sudo nano /etc/systemd/system/loudness-recorder-port2.service
 ```
 
 아래 내용을 붙여 넣는다.
 
 ```ini
 [Unit]
-Description=LoudnessLogger2 DeckLink PCM recorder
+Description=LoudnessLogger2 DeckLink port 2 recorder
 After=local-fs.target
 RequiresMountsFor=/mnt/hdd
 StartLimitIntervalSec=60
@@ -52,20 +65,30 @@ Type=simple
 User=duck
 Group=duck
 WorkingDirectory=/home/duck/Codes/LoudnessLogger2
-ExecStartPre=/usr/bin/test -d /mnt/hdd/recordings
-ExecStartPre=/usr/bin/test -w /mnt/hdd/recordings
-ExecStart=/home/duck/Codes/LoudnessLogger2/decklink_pcm_recorder --device 0 --segment-minutes 60 --queue-mib 64 --lkfs-filter rbj
+ExecStartPre=/usr/bin/test -w /mnt/hdd/recordings/decklink2
+ExecStart=/home/duck/Codes/LoudnessLogger2/decklink_pcm_recorder --device 1 --output /mnt/hdd/recordings/decklink2 --segment-minutes 60 --queue-mib 64 --lkfs-filter rbj
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
 KillSignal=SIGTERM
-UMask=0022
-StandardOutput=append:/home/duck/Codes/LoudnessLogger2/logs/recorder.log
-StandardError=append:/home/duck/Codes/LoudnessLogger2/logs/recorder.log
+UMask=0002
+StandardOutput=append:/home/duck/Codes/LoudnessLogger2/logs/recorder-port2.log
+StandardError=append:/home/duck/Codes/LoudnessLogger2/logs/recorder-port2.log
 
 [Install]
 WantedBy=multi-user.target
 ```
+
+포트 3과 4는 이 파일을 복사한 뒤 아래 값만 바꾼다.
+
+| 서비스 | `--device` | `--output` | 로그 |
+|---|---:|---|---|
+| `loudness-recorder-port2.service` | `1` | `/mnt/hdd/recordings/decklink2` | `recorder-port2.log` |
+| `loudness-recorder-port3.service` | `2` | `/mnt/hdd/recordings/decklink3` | `recorder-port3.log` |
+| `loudness-recorder-port4.service` | `3` | `/mnt/hdd/recordings/decklink4` | `recorder-port4.log` |
+
+장치 순서는 카드 구성에 따라 달라질 수 있으므로 새 서버에서는 반드시
+`./decklink_pcm_recorder --list-devices` 결과를 먼저 확인한다.
 
 서버의 로그인 사용자가 `duck`이 아니라면 `User=`와 `Group=`을 실제 계정으로
 바꾼다. 프로젝트 위치가 다르면 `WorkingDirectory=`, `ExecStart=`,
@@ -100,11 +123,6 @@ User=duck
 Group=duck
 WorkingDirectory=/home/duck/Codes/LoudnessLogger2/web
 Environment=NODE_ENV=production
-Environment=LOUDNESS_WEB_HOST=0.0.0.0
-Environment=LOUDNESS_WEB_PORT=8080
-ExecStartPre=/usr/bin/test -w /mnt/hdd/recordings
-ExecStartPre=/usr/bin/test -w /mnt/hdd/schedules
-ExecStartPre=/usr/bin/test -w /mnt/hdd/reports
 ExecStart=/home/duck/.nvm/versions/node/v20.9.0/bin/node /home/duck/Codes/LoudnessLogger2/web/server.mjs
 Restart=always
 RestartSec=5
@@ -121,20 +139,27 @@ WantedBy=multi-user.target
 프로젝트 위치나 사용자 계정이 다르면 녹음 서비스와 마찬가지로 경로,
 `User=`와 `Group=`을 바꾼다. Node 경로는 앞에서 실행한 `command -v node`의
 출력으로 `ExecStart=` 첫 번째 경로를 바꾼다. NVM의 Node 버전을 변경하면 이 경로도
-새 버전에 맞게 수정해야 한다. `0.0.0.0:8080`은 같은 네트워크의 다른 PC에서도
-접속할 수 있는 설정이다. 인증 기능을 추가하기 전에는 신뢰할 수 있는 내부망에서만
-사용한다.
+새 버전에 맞게 수정해야 한다. 웹에서 감시할 채널 이름과 녹음 경로, 리포트 계산
+채널, 편성표 API 주소는 웹의 **설정** 화면에서 관리하며 `web/settings.json`에
+저장된다. listen 주소, 포트, 편성·리포트 저장 경로는 `web/server.mjs` 상단의
+`serverSettings`에서 설정한다.
+`0.0.0.0:8080`은 같은 네트워크의 다른 PC에서도 접속할 수 있는 설정이다. 인증
+기능을 추가하기 전에는 신뢰할 수 있는 내부망에서만 사용한다.
 
 ## 4. 등록하고 자동 시작
 
 ```bash
 sudo systemd-analyze verify \
-  /etc/systemd/system/loudness-recorder.service \
+  /etc/systemd/system/loudness-recorder-port2.service \
+  /etc/systemd/system/loudness-recorder-port3.service \
+  /etc/systemd/system/loudness-recorder-port4.service \
   /etc/systemd/system/loudness-web.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now \
-  loudness-recorder.service \
+  loudness-recorder-port2.service \
+  loudness-recorder-port3.service \
+  loudness-recorder-port4.service \
   loudness-web.service
 ```
 
@@ -144,26 +169,36 @@ sudo systemctl enable --now \
 ## 5. 정상 동작 확인
 
 ```bash
-systemctl status loudness-recorder.service --no-pager
+systemctl status \
+  loudness-recorder-port2.service \
+  loudness-recorder-port3.service \
+  loudness-recorder-port4.service \
+  --no-pager
 systemctl status loudness-web.service --no-pager
-tail -n 100 /home/duck/Codes/LoudnessLogger2/logs/recorder.log
+tail -n 100 /home/duck/Codes/LoudnessLogger2/logs/recorder-port2.log
+tail -n 100 /home/duck/Codes/LoudnessLogger2/logs/recorder-port3.log
+tail -n 100 /home/duck/Codes/LoudnessLogger2/logs/recorder-port4.log
 tail -n 100 /home/duck/Codes/LoudnessLogger2/logs/web.log
 ```
 
 실시간 로그는 다음 명령으로 확인한다.
 
 ```bash
-tail -f /home/duck/Codes/LoudnessLogger2/logs/recorder.log \
+tail -f /home/duck/Codes/LoudnessLogger2/logs/recorder-port2.log \
+  /home/duck/Codes/LoudnessLogger2/logs/recorder-port3.log \
+  /home/duck/Codes/LoudnessLogger2/logs/recorder-port4.log \
   /home/duck/Codes/LoudnessLogger2/logs/web.log
 ```
 
-정상 동작 중에는 `/mnt/hdd/recordings`의 현재 WAV와 M-LKFS CSV 크기가 계속
-증가한다.
+정상 동작 중에는 `/mnt/hdd/recordings/decklink2`부터 `decklink4`까지 각
+디렉터리의 현재 WAV와 M-LKFS CSV 크기가 계속 증가한다.
 
 서비스 실행 자체가 실패한 경우에는 systemd journal도 확인한다.
 
 ```bash
-journalctl -u loudness-recorder.service -n 100 --no-pager
+journalctl -u loudness-recorder-port2.service -n 100 --no-pager
+journalctl -u loudness-recorder-port3.service -n 100 --no-pager
+journalctl -u loudness-recorder-port4.service -n 100 --no-pager
 journalctl -u loudness-web.service -n 100 --no-pager
 ```
 
@@ -205,9 +240,9 @@ sudo logrotate --debug /etc/logrotate.d/loudness-logger
 ## 7. 기본 관리 명령
 
 ```bash
-sudo systemctl start loudness-recorder.service
-sudo systemctl stop loudness-recorder.service
-sudo systemctl restart loudness-recorder.service
+sudo systemctl start loudness-recorder-port2.service
+sudo systemctl stop loudness-recorder-port2.service
+sudo systemctl restart loudness-recorder-port2.service
 
 sudo systemctl start loudness-web.service
 sudo systemctl stop loudness-web.service
@@ -223,6 +258,8 @@ DeckLink 입력이 충돌할 수 있으므로 동시에 실행하지 않는다.
 cd /home/duck/Codes/LoudnessLogger2
 make
 sudo systemctl restart \
-  loudness-recorder.service \
+  loudness-recorder-port2.service \
+  loudness-recorder-port3.service \
+  loudness-recorder-port4.service \
   loudness-web.service
 ```

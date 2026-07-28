@@ -18,6 +18,7 @@
 /schedules/
 /reports/
 /web/node_modules/
+/web/settings.json
 
 # Runtime logs
 /logs/*

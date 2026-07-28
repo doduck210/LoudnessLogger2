@@ -145,18 +145,17 @@ cd web
 npm start
 ```
 
-기본 주소는 `http://127.0.0.1:8080`이다. 편성표는
-`/mnt/hdd/schedules/SBS_HD_Schedule_YYYY-MM-DD.json` 한 파일만 사용한다. 저장된 파일이
-없으면 화면에서 API 편성표를 받아 만들 수 있고, 수정 저장과 API 새로고침은 같은
-파일을 원자적으로 교체한다. 리포트는 `/mnt/hdd/reports/`에 생성된다.
+기본적으로 모든 네트워크 인터페이스의 8080 포트에서 대기하므로 브라우저에서
+`http://SERVER_IP:8080`으로 접속한다. 편성표는 채널별로
+`/mnt/hdd/schedules/{channel-id}_Schedule_YYYY-MM-DD.json`에 저장된다. 저장된 파일이
+없으면 화면에서 해당 채널의 API 편성표를 받아 만들 수 있고, 수정 저장과 API
+새로고침은 같은 파일을 원자적으로 교체한다. 리포트는
+`/mnt/hdd/reports/{channel-id}_Loudness_Report_YYYY-MM-DD.xlsx`로 생성된다.
 
-운영 경로와 listen 주소는 환경변수로 변경할 수 있다.
-
-```bash
-LOUDNESS_WEB_HOST=0.0.0.0 \
-LOUDNESS_WEB_PORT=8080 \
-LOUDNESS_RECORDINGS_DIR=/mnt/loudness/recordings \
-LOUDNESS_SCHEDULES_DIR=/mnt/loudness/schedules \
-LOUDNESS_REPORTS_DIR=/mnt/loudness/reports \
-npm start
-```
+웹의 **설정** 화면에서 감시할 채널 이름과 녹음 경로를 여러 개 등록할 수 있다.
+설정은 `web/settings.json`에 저장되며 재시작 후에도 유지된다. 기본값은
+`/mnt/hdd/recordings/decklink2`, `decklink3`, `decklink4` 세 채널이다.
+각 채널을 리포트 대상으로 선택하고 편성 종류를 HD 또는 UHD로 지정할 수 있다.
+HD는 편성표 API에 `UHDSchedule=False`, UHD는 `UHDSchedule=True`를 자동으로
+전달한다. 편성표 API 주소도 설정 화면에서 지정한다. listen 주소와 포트,
+편성·리포트 저장 경로는 `web/server.mjs` 상단의 `serverSettings`에서 변경한다.

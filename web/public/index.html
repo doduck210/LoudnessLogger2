@@ -29,6 +29,9 @@
           <button class="nav-item" data-view="reports">
             <span class="nav-icon">↧</span>리포트
           </button>
+          <button class="nav-item" data-view="settings">
+            <span class="nav-icon">⚙</span>설정
+          </button>
         </nav>
         <div class="sidebar-foot">
           <span class="status-dot"></span>
@@ -52,22 +55,12 @@
           <div class="hero-grid">
             <article class="hero-card recorder-card">
               <div class="card-head">
-                <span>DECKLINK INPUT</span>
-                <span id="recorder-badge" class="badge neutral">확인 중</span>
+                <span>DECKLINK INPUTS</span>
+                <span id="recorder-summary" class="badge neutral">확인 중</span>
               </div>
-              <div class="signal">
-                <div class="signal-bars" aria-hidden="true">
-                  <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
-                </div>
-                <div>
-                  <strong id="recorder-title">입력 상태 확인 중</strong>
-                  <small>48 kHz · Stereo · PCM 32-bit</small>
-                </div>
+              <div id="recorder-list" class="recorder-list">
+                <div class="recorder-empty">입력 상태 확인 중</div>
               </div>
-              <dl class="metric-list">
-                <div><dt>현재 WAV</dt><dd id="latest-wav">—</dd></div>
-                <div><dt>M-LKFS 로그</dt><dd id="latest-csv">—</dd></div>
-              </dl>
             </article>
 
             <article class="hero-card storage-card">
@@ -96,6 +89,7 @@
                 <div><p class="eyebrow">QUICK ACTION</p><h2>리포트 생성</h2></div>
               </div>
               <div class="quick-report">
+                <label>채널<select id="dashboard-channel"></select></label>
                 <label>방송일<input id="dashboard-date" type="date" /></label>
                 <button id="open-schedule" class="button primary">편성표 확인</button>
               </div>
@@ -113,6 +107,7 @@
 
         <section id="schedule-view" class="view">
           <div class="toolbar panel">
+            <label>채널<select id="schedule-channel"></select></label>
             <label>방송일<input id="schedule-date" type="date" /></label>
             <div class="toolbar-actions">
               <button id="load-schedule" class="button secondary">편성표 열기</button>
@@ -154,6 +149,40 @@
               <div><p class="eyebrow">REPORT ARCHIVE</p><h2>생성된 리포트</h2></div>
             </div>
             <div id="report-list" class="report-grid empty">리포트가 없습니다.</div>
+          </article>
+        </section>
+
+        <section id="settings-view" class="view">
+          <article class="panel settings-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">CHANNEL CONFIGURATION</p>
+                <h2>녹음 채널 설정</h2>
+              </div>
+              <button id="add-channel" class="button secondary">채널 추가</button>
+            </div>
+            <p class="muted">
+              대시보드와 리포트에서 읽을 채널 이름과 WAV·M-LKFS 디렉터리를
+              등록합니다. 경로는 서버의 절대경로로 입력하세요.
+            </p>
+            <div class="settings-general">
+              <label>
+                편성표 API 주소
+                <input
+                  id="schedule-api"
+                  type="url"
+                  placeholder="http://server/path/dailyInfo.json"
+                  spellcheck="false"
+                />
+              </label>
+              <small>
+                날짜와 UHDSchedule 쿼리는 편성표를 받을 때 자동으로 추가됩니다.
+              </small>
+            </div>
+            <div id="channel-settings" class="channel-settings"></div>
+            <div class="settings-actions">
+              <button id="save-settings" class="button primary">설정 저장</button>
+            </div>
           </article>
         </section>
       </main>
