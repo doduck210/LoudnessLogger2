@@ -18,5 +18,7 @@ inline const std::filesystem::path kSchedulesDirectory =
     kStorageRoot / "schedules";
 inline const std::filesystem::path kReportsDirectory =
     kStorageRoot / "reports";
+inline const std::filesystem::path kProgramAudioDirectory =
+    kReportsDirectory / "program_audio";
 
 }  // namespace config

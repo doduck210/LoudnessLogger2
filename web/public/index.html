@@ -93,7 +93,11 @@
                 <label>방송일<input id="dashboard-date" type="date" /></label>
                 <button id="open-schedule" class="button primary">편성표 확인</button>
               </div>
-              <p class="muted">편성표를 확인하거나 수정한 뒤 약 0.4초 안에 일일 리포트를 생성합니다.</p>
+              <p class="muted">
+                편성표를 확인하거나 수정한 뒤 리포트와 편성별 청취용 WAV를
+                생성합니다. 리포트는 먼저 완료되고, 오디오는 별도 백그라운드
+                작업으로 계속 처리됩니다.
+              </p>
             </article>
             <article class="panel">
               <div class="panel-head">
@@ -133,7 +137,7 @@
             <div class="table-wrap">
               <table>
                 <thead>
-                  <tr><th>#</th><th>시작 시각</th><th>길이</th><th>편성명</th><th>프로그램 ID</th><th></th></tr>
+                  <tr><th>#</th><th>시작 시각</th><th>길이</th><th>편성명</th><th>프로그램 ID</th><th>청취</th></tr>
                 </thead>
                 <tbody id="schedule-rows">
                   <tr class="empty-row"><td colspan="6">방송일을 선택하고 편성표를 여세요.</td></tr>
@@ -144,6 +148,21 @@
         </section>
 
         <section id="reports-view" class="view">
+          <article class="panel audio-job-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">BACKGROUND AUDIO</p>
+                <h2>편성 오디오 작업</h2>
+              </div>
+              <span id="audio-job-summary" class="muted">
+                실행 기록이 없습니다.
+              </span>
+            </div>
+            <div id="audio-job-list" class="audio-job-list empty">
+              백그라운드 오디오 작업이 없습니다.
+            </div>
+            <pre id="audio-job-log" class="audio-job-log">작업을 선택하면 실행 로그가 표시됩니다.</pre>
+          </article>
           <article class="panel">
             <div class="panel-head">
               <div><p class="eyebrow">REPORT ARCHIVE</p><h2>생성된 리포트</h2></div>
@@ -176,8 +195,29 @@
                 />
               </label>
               <small>
-                날짜와 UHDSchedule 쿼리는 편성표를 받을 때 자동으로 추가됩니다.
+                날짜가 자동으로 추가되며, 편성표는 항상 HD 기준
+                (UHDSchedule=False)으로 요청됩니다.
               </small>
+              <div class="settings-schedule-row">
+                <label>
+                  자동 리포트
+                  <span class="setting-check">
+                    <input id="report-schedule-enabled" type="checkbox" />
+                    <span>매일 실행</span>
+                  </span>
+                </label>
+                <label>
+                  실행 시각 (KST)
+                  <input id="report-schedule-time" type="time" step="60" />
+                </label>
+              </div>
+              <small>
+                지정 시각에 모든 리포트 대상 채널의 전날 편성표를 받아 순차적으로
+                리포트를 생성합니다.
+              </small>
+              <div id="scheduler-status" class="scheduler-status">
+                최근 자동 실행 기록이 없습니다.
+              </div>
             </div>
             <div id="channel-settings" class="channel-settings"></div>
             <div class="settings-actions">

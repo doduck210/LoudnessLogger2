@@ -25,9 +25,11 @@ const serverSettings = Object.freeze({
   port: 8080,
   schedulesDirectory: "/mnt/hdd/schedules",
   reportsDirectory: "/mnt/hdd/reports",
+  programAudioDirectory: "/mnt/hdd/reports/program_audio",
   reportExecutable: join(projectDirectory, "loudness_report"),
   scheduleApi: "http://10.110.21.31/cms/api/frmtn/dailyInfo.json",
   runtimeSettingsFile: join(webDirectory, "settings.json"),
+  schedulerStateFile: join(webDirectory, "scheduler-state.json"),
 });
 
 const config = Object.freeze({
@@ -35,46 +37,55 @@ const config = Object.freeze({
   port: parsePort(serverSettings.port),
   schedulesDirectory: resolve(serverSettings.schedulesDirectory),
   reportsDirectory: resolve(serverSettings.reportsDirectory),
+  programAudioDirectory: resolve(serverSettings.programAudioDirectory),
   reportExecutable: resolve(serverSettings.reportExecutable),
   runtimeSettingsFile: resolve(serverSettings.runtimeSettingsFile),
+  schedulerStateFile: resolve(serverSettings.schedulerStateFile),
 });
 
 const defaultRuntimeSettings = Object.freeze({
   scheduleApi: serverSettings.scheduleApi,
+  reportSchedule: {
+    enabled: true,
+    timeKst: "08:00",
+  },
   channels: [
     {
       id: "decklink2",
       name: "DeckLink 2",
       recordingsDirectory: "/mnt/hdd/recordings/decklink2",
       reportEnabled: true,
-      scheduleType: "HD",
     },
     {
       id: "decklink3",
       name: "DeckLink 3",
       recordingsDirectory: "/mnt/hdd/recordings/decklink3",
       reportEnabled: true,
-      scheduleType: "UHD",
     },
     {
       id: "decklink4",
       name: "DeckLink 4",
       recordingsDirectory: "/mnt/hdd/recordings/decklink4",
       reportEnabled: false,
-      scheduleType: "HD",
     },
   ],
 });
 
 const jobs = new Map();
+const audioJobs = new Map();
+const audioQueue = [];
+let audioWorkerBusy = false;
 const maxRequestBytes = 8 * 1024 * 1024;
 const maxJobLogCharacters = 200_000;
 
 await Promise.all([
   mkdir(config.schedulesDirectory, { recursive: true }),
   mkdir(config.reportsDirectory, { recursive: true }),
+  mkdir(config.programAudioDirectory, { recursive: true }),
 ]);
 let runtimeSettings = await loadRuntimeSettings();
+let schedulerState = await loadSchedulerState();
+let schedulerBusy = false;
 
 function parsePort(value) {
   const port = Number(value);
@@ -100,6 +111,17 @@ function validateRuntimeSettings(value) {
   if (!["http:", "https:"].includes(parsedScheduleApi.protocol)) {
     throw httpError(400, "편성표 API는 http 또는 https 주소여야 합니다.");
   }
+  const rawReportSchedule = value.reportSchedule || {};
+  const reportSchedule = {
+    enabled:
+      typeof rawReportSchedule.enabled === "boolean"
+        ? rawReportSchedule.enabled
+        : true,
+    timeKst: String(rawReportSchedule.timeKst || "08:00").trim(),
+  };
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(reportSchedule.timeKst)) {
+    throw httpError(400, "자동 리포트 실행 시각이 올바르지 않습니다.");
+  }
   if (
     !Array.isArray(value.channels) ||
     value.channels.length < 1 ||
@@ -108,6 +130,7 @@ function validateRuntimeSettings(value) {
     throw httpError(400, "채널은 1개 이상 16개 이하로 등록해야 합니다.");
   }
   const ids = new Set();
+  const fileNames = new Set();
   const legacyReportChannelId = String(value.reportChannelId || "").trim();
   const channels = value.channels.map((channel, index) => {
     const id = String(channel?.id || "").trim();
@@ -125,6 +148,15 @@ function validateRuntimeSettings(value) {
     if (!name || name.length > 80) {
       throw httpError(400, `${index + 1}번 채널 이름이 올바르지 않습니다.`);
     }
+    const fileName = channelFileName({ name });
+    const fileNameKey = fileName.toLocaleLowerCase("en-US");
+    if (!fileName || fileNames.has(fileNameKey)) {
+      throw httpError(
+        400,
+        `${name}의 파일명이 비어 있거나 다른 채널 이름과 중복됩니다.`,
+      );
+    }
+    fileNames.add(fileNameKey);
     if (!isAbsolute(recordingsDirectory)) {
       throw httpError(400, `${name}의 녹음 경로는 절대경로여야 합니다.`);
     }
@@ -132,16 +164,11 @@ function validateRuntimeSettings(value) {
       typeof channel.reportEnabled === "boolean"
         ? channel.reportEnabled
         : id === legacyReportChannelId;
-    const scheduleType =
-      String(channel.scheduleType || "HD").toUpperCase() === "UHD"
-        ? "UHD"
-        : "HD";
     return {
       id,
       name,
       recordingsDirectory: resolve(recordingsDirectory),
       reportEnabled,
-      scheduleType,
     };
   });
   if (!channels.some((channel) => channel.reportEnabled)) {
@@ -149,6 +176,7 @@ function validateRuntimeSettings(value) {
   }
   return {
     scheduleApi: parsedScheduleApi.toString(),
+    reportSchedule,
     channels,
   };
 }
@@ -191,6 +219,42 @@ async function saveRuntimeSettings(value) {
   return settings;
 }
 
+async function loadSchedulerState() {
+  try {
+    const value = JSON.parse(await readFile(config.schedulerStateFile, "utf8"));
+    return {
+      lastAttemptDateKst:
+        typeof value.lastAttemptDateKst === "string"
+          ? value.lastAttemptDateKst
+          : null,
+      broadcastDate:
+        typeof value.broadcastDate === "string" ? value.broadcastDate : null,
+      status: typeof value.status === "string" ? value.status : "idle",
+      startedAt:
+        typeof value.startedAt === "string" ? value.startedAt : null,
+      finishedAt:
+        typeof value.finishedAt === "string" ? value.finishedAt : null,
+      results: Array.isArray(value.results) ? value.results : [],
+    };
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.error(`자동 리포트 상태 파일을 읽지 못했습니다: ${error.message}`);
+    }
+    return {
+      lastAttemptDateKst: null,
+      broadcastDate: null,
+      status: "idle",
+      startedAt: null,
+      finishedAt: null,
+      results: [],
+    };
+  }
+}
+
+async function saveSchedulerState() {
+  await atomicWriteJson(config.schedulerStateFile, schedulerState);
+}
+
 function requireChannel(channelId, reportOnly = false) {
   const channel = runtimeSettings.channels.find(
     (candidate) => candidate.id === String(channelId || ""),
@@ -204,18 +268,30 @@ function requireChannel(channelId, reportOnly = false) {
   return channel;
 }
 
+function channelFileName(channel) {
+  return channel.name
+    .normalize("NFKC")
+    .trim()
+    .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "_")
+    .replace(/[.\s]+$/g, "");
+}
+
 function schedulePath(channel, date) {
   return join(
     config.schedulesDirectory,
-    `${channel.id}_Schedule_${date}.json`,
+    `${channelFileName(channel)}_Schedule_${date}.json`,
   );
 }
 
 function reportPath(channel, date) {
   return join(
     config.reportsDirectory,
-    `${channel.id}_Loudness_Report_${date}.xlsx`,
+    `${channelFileName(channel)}_Loudness_Report_${date}.xlsx`,
   );
+}
+
+function programAudioPath(channel, date) {
+  return join(config.programAudioDirectory, channelFileName(channel), date);
 }
 
 function requireDate(value) {
@@ -305,10 +381,7 @@ async function readSchedule(channel, date) {
 async function fetchSchedule(channel, date) {
   const url = new URL(runtimeSettings.scheduleApi);
   url.searchParams.set("date", date);
-  url.searchParams.set(
-    "UHDSchedule",
-    channel.scheduleType === "UHD" ? "True" : "False",
-  );
+  url.searchParams.set("UHDSchedule", "False");
   const response = await fetch(url, {
     headers: { Accept: "application/json" },
     signal: AbortSignal.timeout(15_000),
@@ -331,7 +404,6 @@ async function fetchSchedule(channel, date) {
   validateSchedule(value, date);
   value.channelId = channel.id;
   value.channelName = channel.name;
-  value.scheduleType = channel.scheduleType;
   await atomicWriteJson(schedulePath(channel, date), value);
   return value;
 }
@@ -436,7 +508,7 @@ async function dashboard() {
     recorders,
     reportChannels: runtimeSettings.channels
       .filter((channel) => channel.reportEnabled)
-      .map(({ id, name, scheduleType }) => ({ id, name, scheduleType })),
+      .map(({ id, name }) => ({ id, name })),
     storage: {
       totalBytes,
       availableBytes,
@@ -473,11 +545,110 @@ function publicJob(job) {
   };
 }
 
+function publicAudioJob(job) {
+  return {
+    id: job.id,
+    date: job.date,
+    state: job.state,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    exitCode: job.exitCode,
+    output: job.output,
+    channelId: job.channelId,
+    channelName: job.channelName,
+  };
+}
+
 function appendJobOutput(job, chunk) {
   job.output += chunk.toString("utf8");
   if (job.output.length > maxJobLogCharacters) {
     job.output = job.output.slice(-maxJobLogCharacters);
   }
+}
+
+function enqueueAudioJob(channel, date) {
+  const duplicate = [...audioJobs.values()].find(
+    (job) =>
+      job.channelId === channel.id &&
+      job.date === date &&
+      ["queued", "running"].includes(job.state),
+  );
+  if (duplicate) return duplicate;
+
+  const job = {
+    id: randomUUID(),
+    date,
+    state: "queued",
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    finishedAt: null,
+    exitCode: null,
+    output: "편성 오디오 작업이 대기열에 추가되었습니다.\n",
+    channelId: channel.id,
+    channelName: channel.name,
+    recordingsDirectory: channel.recordingsDirectory,
+    schedulePath: schedulePath(channel, date),
+    audioOutputPath: programAudioPath(channel, date),
+  };
+  audioJobs.set(job.id, job);
+  audioQueue.push(job);
+  while (audioJobs.size > 100) {
+    const oldest = audioJobs.keys().next().value;
+    if (["queued", "running"].includes(audioJobs.get(oldest)?.state)) break;
+    audioJobs.delete(oldest);
+  }
+  void runNextAudioJob();
+  return job;
+}
+
+async function runNextAudioJob() {
+  if (audioWorkerBusy) return;
+  const job = audioQueue.shift();
+  if (!job) return;
+  audioWorkerBusy = true;
+  job.state = "running";
+  job.startedAt = new Date().toISOString();
+  appendJobOutput(
+    job,
+    `백그라운드 작업 시작: ${job.channelName} ${job.date}\n`,
+  );
+
+  const args = [
+    "--audio-only",
+    "--date",
+    job.date,
+    "--recordings",
+    job.recordingsDirectory,
+    "--schedule-json",
+    job.schedulePath,
+    "--audio-output",
+    job.audioOutputPath,
+    "--force",
+  ];
+  const child = spawn(config.reportExecutable, args, {
+    cwd: projectDirectory,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", (chunk) => appendJobOutput(job, chunk));
+  child.stderr.on("data", (chunk) => appendJobOutput(job, chunk));
+
+  let finalized = false;
+  const finish = (state, code, message = "") => {
+    if (finalized) return;
+    finalized = true;
+    if (message) appendJobOutput(job, `\n${message}\n`);
+    job.exitCode = code;
+    job.state = state;
+    job.finishedAt = new Date().toISOString();
+    audioWorkerBusy = false;
+    void runNextAudioJob();
+  };
+  child.on("error", (error) => finish("failed", null, error.message));
+  child.on("close", (code) => {
+    finish(code === 0 ? "completed" : code === 2 ? "warning" : "failed", code);
+  });
 }
 
 async function startReportJob(channel, date) {
@@ -502,6 +673,9 @@ async function startReportJob(channel, date) {
     channelId: channel.id,
     channelName: channel.name,
   };
+  job.completion = new Promise((resolveCompletion) => {
+    job.resolveCompletion = resolveCompletion;
+  });
   jobs.set(id, job);
 
   const args = [
@@ -515,6 +689,7 @@ async function startReportJob(channel, date) {
     schedulePath(channel, date),
     "--output",
     output,
+    "--no-audio",
     "--force",
   ];
   const child = spawn(config.reportExecutable, args, {
@@ -530,13 +705,138 @@ async function startReportJob(channel, date) {
     job.state = "failed";
     job.finishedAt = new Date().toISOString();
     appendJobOutput(job, `\n${error.message}\n`);
+    job.resolveCompletion(job);
   });
   child.on("close", (code) => {
     job.exitCode = code;
     job.finishedAt = new Date().toISOString();
     job.state = code === 0 ? "completed" : code === 2 ? "warning" : "failed";
+    if (code === 0 || code === 2) {
+      const audioJob = enqueueAudioJob(channel, date);
+      appendJobOutput(
+        job,
+        `\n편성 오디오는 백그라운드 작업 ${audioJob.id}에서 생성됩니다.\n`,
+      );
+    }
+    job.resolveCompletion(job);
   });
-  return publicJob(job);
+  return job;
+}
+
+function kstNowParts(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(now);
+  const values = Object.fromEntries(
+    parts.map(({ type, value }) => [type, value]),
+  );
+  return {
+    date: `${values.year}-${values.month}-${values.day}`,
+    time: `${values.hour}:${values.minute}`,
+  };
+}
+
+function previousDate(date) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() - 1);
+  return value.toISOString().slice(0, 10);
+}
+
+function hasActiveReportJob() {
+  return [...jobs.values()].some((job) =>
+    ["queued", "running"].includes(job.state),
+  );
+}
+
+async function waitForReportSlot() {
+  while (hasActiveReportJob()) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+  }
+}
+
+async function runScheduledReports(runDateKst, broadcastDate) {
+  const channels = runtimeSettings.channels.filter(
+    (channel) => channel.reportEnabled,
+  );
+  schedulerState = {
+    lastAttemptDateKst: runDateKst,
+    broadcastDate,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    results: [],
+  };
+  await saveSchedulerState();
+  console.log(
+    `자동 리포트 시작: 방송일=${broadcastDate}, 채널=${channels.length}`,
+  );
+
+  for (const channel of channels) {
+    const result = {
+      channelId: channel.id,
+      channelName: channel.name,
+      state: "running",
+      message: "",
+      reportName: null,
+    };
+    schedulerState.results.push(result);
+    await saveSchedulerState();
+    try {
+      await fetchSchedule(channel, broadcastDate);
+      await waitForReportSlot();
+      const job = await startReportJob(channel, broadcastDate);
+      await job.completion;
+      result.state = job.state;
+      result.reportName = job.reportName;
+      result.message =
+        job.state === "completed"
+          ? "리포트 생성 완료"
+          : job.output.slice(-2_000);
+    } catch (error) {
+      result.state = "failed";
+      result.message = error.message;
+      console.error(`자동 리포트 실패 (${channel.name}): ${error.message}`);
+    }
+    await saveSchedulerState();
+  }
+
+  schedulerState.status = schedulerState.results.some(
+    (result) => result.state === "failed",
+  )
+    ? "failed"
+    : schedulerState.results.some((result) => result.state === "warning")
+      ? "warning"
+      : "completed";
+  schedulerState.finishedAt = new Date().toISOString();
+  await saveSchedulerState();
+  console.log(
+    `자동 리포트 종료: 방송일=${broadcastDate}, 상태=${schedulerState.status}`,
+  );
+}
+
+async function checkReportSchedule() {
+  if (schedulerBusy || !runtimeSettings.reportSchedule.enabled) return;
+  const now = kstNowParts();
+  if (
+    now.time < runtimeSettings.reportSchedule.timeKst ||
+    schedulerState.lastAttemptDateKst === now.date
+  ) {
+    return;
+  }
+  schedulerBusy = true;
+  try {
+    await runScheduledReports(now.date, previousDate(now.date));
+  } catch (error) {
+    console.error(`자동 리포트 스케줄러 오류: ${error.stack || error.message}`);
+  } finally {
+    schedulerBusy = false;
+  }
 }
 
 function sendJson(response, status, value) {
@@ -572,6 +872,44 @@ async function sendFile(response, path, contentType, downloadName = null) {
   createReadStream(path).pipe(response);
 }
 
+async function sendAudioFile(request, response, path) {
+  const info = await stat(path);
+  const range = request.headers.range;
+  let start = 0;
+  let end = info.size - 1;
+  let status = 200;
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match || (!match[1] && !match[2])) {
+      throw httpError(416, "올바르지 않은 오디오 범위 요청입니다.");
+    }
+    if (match[1]) {
+      start = Number(match[1]);
+      if (match[2]) end = Number(match[2]);
+    } else {
+      const suffix = Number(match[2]);
+      start = Math.max(0, info.size - suffix);
+    }
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+        start < 0 || end < start || start >= info.size) {
+      throw httpError(416, "요청한 오디오 범위를 읽을 수 없습니다.");
+    }
+    end = Math.min(end, info.size - 1);
+    status = 206;
+  }
+  const headers = {
+    "Content-Type": "audio/wav",
+    "Content-Length": end - start + 1,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, no-cache",
+  };
+  if (status === 206) {
+    headers["Content-Range"] = `bytes ${start}-${end}/${info.size}`;
+  }
+  response.writeHead(status, headers);
+  createReadStream(path, { start, end }).pipe(response);
+}
+
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -588,6 +926,9 @@ async function route(request, response) {
   }
   if (request.method === "GET" && pathname === "/api/settings") {
     return sendJson(response, 200, runtimeSettings);
+  }
+  if (request.method === "GET" && pathname === "/api/scheduler") {
+    return sendJson(response, 200, schedulerState);
   }
   if (request.method === "PUT" && pathname === "/api/settings") {
     return sendJson(
@@ -614,7 +955,6 @@ async function route(request, response) {
     const schedule = validateSchedule(body.schedule, date);
     schedule.channelId = channel.id;
     schedule.channelName = channel.name;
-    schedule.scheduleType = channel.scheduleType;
     await atomicWriteJson(schedulePath(channel, date), schedule);
     return sendJson(response, 200, schedule);
   }
@@ -624,7 +964,7 @@ async function route(request, response) {
     return sendJson(
       response,
       202,
-      await startReportJob(channel, requireDate(body.date)),
+      publicJob(await startReportJob(channel, requireDate(body.date))),
     );
   }
   if (request.method === "GET" && pathname.startsWith("/api/jobs/")) {
@@ -642,6 +982,55 @@ async function route(request, response) {
       ),
     );
   }
+  if (request.method === "GET" && pathname === "/api/audio-jobs") {
+    return sendJson(
+      response,
+      200,
+      [...audioJobs.values()]
+        .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+        .slice(0, 20)
+        .map(publicAudioJob),
+    );
+  }
+  if (request.method === "GET" && pathname === "/api/program-audio") {
+    const channel = requireChannel(url.searchParams.get("channelId"), true);
+    const date = requireDate(url.searchParams.get("date"));
+    const rebuilding = [...audioJobs.values()].some(
+      (job) =>
+        job.channelId === channel.id &&
+        job.date === date &&
+        ["queued", "running"].includes(job.state),
+    );
+    if (rebuilding) return sendJson(response, 200, []);
+    return sendJson(
+      response,
+      200,
+      await directoryFiles(
+        programAudioPath(channel, date),
+        (name) => name.endsWith(".wav"),
+      ),
+    );
+  }
+  if (request.method === "GET" && pathname === "/api/program-audio/file") {
+    const channel = requireChannel(url.searchParams.get("channelId"), true);
+    const date = requireDate(url.searchParams.get("date"));
+    const name = String(url.searchParams.get("name") || "");
+    if (
+      !name ||
+      name.length > 255 ||
+      name.includes("/") ||
+      name.includes("\\") ||
+      /[\u0000-\u001f\u007f]/.test(name) ||
+      !name.endsWith(".wav")
+    ) {
+      throw httpError(400, "올바르지 않은 편성 오디오 파일명입니다.");
+    }
+    return sendAudioFile(
+      request,
+      response,
+      join(programAudioPath(channel, date), name),
+    );
+  }
   if (
     request.method === "GET" &&
     pathname.startsWith("/api/reports/") &&
@@ -653,9 +1042,12 @@ async function route(request, response) {
     );
     const name = decodeURIComponent(encoded);
     if (
+      !name ||
+      name.length > 255 ||
       name.includes("/") ||
       name.includes("\\") ||
-      !/^[A-Za-z0-9_.-]+\.xlsx$/.test(name)
+      /[\u0000-\u001f\u007f]/.test(name) ||
+      !name.endsWith(".xlsx")
     ) {
       throw httpError(400, "올바르지 않은 리포트 파일명입니다.");
     }
@@ -712,8 +1104,20 @@ server.listen(config.port, config.host, () => {
   );
 });
 
+const schedulerStartupTimer = setTimeout(() => {
+  void checkReportSchedule();
+}, 1_000);
+const schedulerTimer = setInterval(() => {
+  void checkReportSchedule();
+}, 30_000);
+
+let shuttingDown = false;
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearTimeout(schedulerStartupTimer);
+    clearInterval(schedulerTimer);
     server.close(() => process.exit(0));
   });
 }

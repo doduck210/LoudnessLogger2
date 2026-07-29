@@ -147,15 +147,31 @@ npm start
 
 기본적으로 모든 네트워크 인터페이스의 8080 포트에서 대기하므로 브라우저에서
 `http://SERVER_IP:8080`으로 접속한다. 편성표는 채널별로
-`/mnt/hdd/schedules/{channel-id}_Schedule_YYYY-MM-DD.json`에 저장된다. 저장된 파일이
+`/mnt/hdd/schedules/{채널이름}_Schedule_YYYY-MM-DD.json`에 저장된다. 저장된 파일이
 없으면 화면에서 해당 채널의 API 편성표를 받아 만들 수 있고, 수정 저장과 API
 새로고침은 같은 파일을 원자적으로 교체한다. 리포트는
-`/mnt/hdd/reports/{channel-id}_Loudness_Report_YYYY-MM-DD.xlsx`로 생성된다.
+`/mnt/hdd/reports/{채널이름}_Loudness_Report_YYYY-MM-DD.xlsx`로 생성된다.
+리포트 생성 시 같은 편성 경계로 원본 PCM을 잘라
+`/mnt/hdd/reports/program_audio/{채널이름}/YYYY-MM-DD/`에 편성별 WAV도 생성한다.
+리포트 파일은 M-LKFS CSV만 사용해 먼저 빠르게 완성하고, 편성 오디오는 별도의
+C++ 프로세스가 백그라운드 큐에서 한 채널씩 생성한다. 진행 상태와 실시간 로그는
+웹의 **Loudness 리포트 → 편성 오디오 작업**에서 확인한다. 웹 편성표의 재생
+버튼으로 완성된 WAV를 브라우저에서 바로 확인할 수 있다. 여러 시간짜리 편성은
+시간별 원본 WAV를 끊김 없이 이어 붙이며, 표준 WAV의 4 GiB 한도를 넘는 장시간
+편성은 `_part01`, `_part02`처럼 자동 분할한다. 원본과 같은 48 kHz, 2채널,
+32-bit PCM이라 재인코딩에 따른 음질 변화는 없다.
+
+편성별 WAV는 해당 시간대 원본과 거의 같은 용량을 추가로 사용한다. 현재 포맷은
+채널당 하루 약 33.2 GB이므로 리포트 대상이 두 채널이면 하루 약 66.4 GB가
+추가된다. 필요하지 않으면 명령행에서 `--no-audio`로 생성을 끌 수 있다.
 
 웹의 **설정** 화면에서 감시할 채널 이름과 녹음 경로를 여러 개 등록할 수 있다.
 설정은 `web/settings.json`에 저장되며 재시작 후에도 유지된다. 기본값은
 `/mnt/hdd/recordings/decklink2`, `decklink3`, `decklink4` 세 채널이다.
-각 채널을 리포트 대상으로 선택하고 편성 종류를 HD 또는 UHD로 지정할 수 있다.
-HD는 편성표 API에 `UHDSchedule=False`, UHD는 `UHDSchedule=True`를 자동으로
-전달한다. 편성표 API 주소도 설정 화면에서 지정한다. listen 주소와 포트,
+각 채널을 리포트 대상으로 선택할 수 있다. 모든 채널은 동일한 HD 편성표를
+사용하며 API에는 항상 `UHDSchedule=False`를 전달한다. 편성표 API 주소와 자동
+리포트 실행 시각도 설정 화면에서 지정한다.
+자동 리포트는 기본적으로 매일 08:00 KST에 모든 리포트 대상 채널의 전날 편성표를
+받아 채널별 리포트를 순차 생성한다. 실행 상태는 `web/scheduler-state.json`에
+저장되어 웹서버 재시작 시 같은 날짜가 중복 실행되지 않는다. listen 주소와 포트,
 편성·리포트 저장 경로는 `web/server.mjs` 상단의 `serverSettings`에서 변경한다.

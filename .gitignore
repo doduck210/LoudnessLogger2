@@ -19,6 +19,7 @@
 /reports/
 /web/node_modules/
 /web/settings.json
+/web/scheduler-state.json
 
 # Runtime logs
 /logs/*

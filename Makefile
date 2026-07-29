@@ -9,7 +9,7 @@ RECORDER_SOURCES := \
 	src/main.cpp \
 	src/WavSegmentWriter.cpp \
 	$(DECKLINK_DIR)/src/DeckLinkAPIDispatch.cpp
-REPORT_SOURCES := src/report_main.cpp
+REPORT_SOURCES := src/report_main.cpp src/ProgramAudioExporter.cpp
 HEADERS := $(wildcard include/*.h $(DECKLINK_DIR)/include/*.h)
 
 CPPFLAGS += -Iinclude -I$(DECKLINK_DIR)/include

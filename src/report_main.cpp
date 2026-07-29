@@ -1,5 +1,6 @@
 #include "Config.h"
 #include "LKFS.h"
+#include "ProgramAudioExporter.h"
 
 #include <algorithm>
 #include <array>
@@ -36,6 +37,7 @@ struct Options {
     std::string date;
     std::filesystem::path recordingsDirectory = config::kRecordingsDirectory;
     std::filesystem::path output;
+    std::filesystem::path audioOutputDirectory;
     std::filesystem::path scheduleJson;
     std::filesystem::path scheduleOutput;
     std::string apiHost = "10.110.21.31";
@@ -43,6 +45,8 @@ struct Options {
     std::string channelName = "SBS_HD";
     bool showHelp = false;
     bool force = false;
+    bool createAudio = true;
+    bool audioOnly = false;
 };
 
 struct Program {
@@ -70,6 +74,9 @@ void printUsage(const char* program) {
         << "  -r, --recordings DIRECTORY   M-LKFS CSV directory (default: "
         << config::kRecordingsDirectory.string() << ")\n"
         << "  -o, --output FILE            Output .xlsx or .csv path\n"
+        << "      --audio-output DIRECTORY Programme WAV output directory\n"
+        << "      --audio-only             Create programme WAV files only\n"
+        << "      --no-audio               Do not create programme WAV files\n"
         << "      --channel NAME           Default output prefix (default: SBS_HD)\n"
         << "      --schedule-json FILE     Read saved API JSON instead of HTTP\n"
         << "      --schedule-output FILE   Save used schedule JSON to this path\n"
@@ -93,6 +100,9 @@ Options parseOptions(int argc, char** argv) {
         {"schedule-output", required_argument, nullptr, 1002},
         {"api-host", required_argument, nullptr, 1003},
         {"api-port", required_argument, nullptr, 1004},
+        {"audio-output", required_argument, nullptr, 1005},
+        {"no-audio", no_argument, nullptr, 1006},
+        {"audio-only", no_argument, nullptr, 1007},
         {"force", no_argument, nullptr, 'f'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0},
@@ -112,6 +122,12 @@ Options parseOptions(int argc, char** argv) {
             case 1002: options.scheduleOutput = optarg; break;
             case 1003: options.apiHost = optarg; break;
             case 1004: options.apiPort = optarg; break;
+            case 1005: options.audioOutputDirectory = optarg; break;
+            case 1006: options.createAudio = false; break;
+            case 1007:
+                options.audioOnly = true;
+                options.createAudio = true;
+                break;
             case 'f': options.force = true; break;
             case 'h': options.showHelp = true; break;
             default: throw std::invalid_argument("Invalid command-line option");
@@ -124,16 +140,22 @@ Options parseOptions(int argc, char** argv) {
     if (!options.showHelp && options.date.empty()) {
         throw std::invalid_argument("--date is required");
     }
-    if (!options.showHelp && options.output.empty()) {
+    if (!options.showHelp && !options.audioOnly && options.output.empty()) {
         options.output =
             config::kReportsDirectory /
             (options.channelName + "_Loudness_Report_" +
              options.date + ".xlsx");
     }
-    if (!options.showHelp && options.scheduleOutput.empty()) {
+    if (!options.showHelp && !options.audioOnly &&
+        options.scheduleOutput.empty()) {
         options.scheduleOutput =
             config::kSchedulesDirectory /
             (options.channelName + "_Schedule_" + options.date + ".json");
+    }
+    if (!options.showHelp && options.createAudio &&
+        options.audioOutputDirectory.empty()) {
+        options.audioOutputDirectory =
+            config::kProgramAudioDirectory / options.channelName / options.date;
     }
     return options;
 }
@@ -1093,12 +1115,13 @@ void writeXlsxReport(const std::filesystem::path& path,
 }
 
 int run(const Options& options) {
-    if (std::filesystem::exists(options.output) && !options.force) {
+    if (!options.audioOnly &&
+        std::filesystem::exists(options.output) && !options.force) {
         throw std::runtime_error(
             "Output already exists; choose another path or use --force: " +
             options.output.string());
     }
-    if (!options.output.parent_path().empty()) {
+    if (!options.audioOnly && !options.output.parent_path().empty()) {
         std::error_code error;
         std::filesystem::create_directories(options.output.parent_path(), error);
         if (error) {
@@ -1120,10 +1143,44 @@ int run(const Options& options) {
         scheduleText = httpGet(options.apiHost, options.apiPort, path);
     }
 
-    writeFile(options.scheduleOutput, scheduleText);
-    std::cout << "Saved schedule JSON: " << options.scheduleOutput << '\n';
+    if (!options.scheduleOutput.empty()) {
+        writeFile(options.scheduleOutput, scheduleText);
+        std::cout << "Saved schedule JSON: "
+                  << options.scheduleOutput << '\n';
+    }
 
     std::vector<Program> programs = parseSchedule(scheduleText);
+    if (options.audioOnly) {
+        std::vector<program_audio::Clip> clips;
+        clips.reserve(programs.size());
+        for (const Program& program : programs) {
+            clips.push_back(program_audio::Clip{
+                program.startTenths,
+                program.durationSeconds,
+                program.title,
+                program.id,
+            });
+        }
+        const program_audio::Result result =
+            program_audio::exportClips(
+                options.recordingsDirectory,
+                options.audioOutputDirectory,
+                clips,
+                options.force);
+        std::cout << "Created programme audio: "
+                  << options.audioOutputDirectory << " ("
+                  << result.created << " files for "
+                  << programs.size() << " schedule items)\n";
+        if (!result.warnings.empty()) {
+            std::cerr << "WARNING: " << result.warnings.size()
+                      << " programme audio files could not be created:\n";
+            for (const std::string& warning : result.warnings) {
+                std::cerr << "  " << warning << '\n';
+            }
+            return 2;
+        }
+        return 0;
+    }
     const std::int64_t rangeStart = programs.front().startTenths;
     const std::int64_t rangeEnd = std::max_element(
         programs.begin(), programs.end(),
@@ -1145,18 +1202,52 @@ int run(const Options& options) {
         throw std::invalid_argument("Output extension must be .xlsx or .csv");
     }
 
+    program_audio::Result audioResult;
+    if (options.createAudio) {
+        std::vector<program_audio::Clip> clips;
+        clips.reserve(programs.size());
+        for (const Program& program : programs) {
+            clips.push_back(program_audio::Clip{
+                program.startTenths,
+                program.durationSeconds,
+                program.title,
+                program.id,
+            });
+        }
+        audioResult = program_audio::exportClips(
+            options.recordingsDirectory,
+            options.audioOutputDirectory,
+            clips,
+            options.force);
+    }
+
     std::cout << "Created report: " << options.output << '\n'
               << "Schedule items: " << programs.size() << '\n'
               << "M-LKFS blocks loaded: " << blocks.size() << '\n';
-    if (incomplete != 0) {
-        std::cerr << "WARNING: " << incomplete
-                  << " schedule items have incomplete or silent M-LKFS data; "
-                     "their ILKFS cells are blank.\n";
+    if (options.createAudio) {
+        std::cout << "Created programme audio: "
+                  << options.audioOutputDirectory << " ("
+                  << audioResult.created << " files for "
+                  << programs.size() << " schedule items)\n";
+    }
+    if (incomplete != 0 || !audioResult.warnings.empty()) {
+        if (incomplete != 0) {
+            std::cerr << "WARNING: " << incomplete
+                      << " schedule items have incomplete or silent M-LKFS data; "
+                         "their ILKFS cells are blank.\n";
+        }
         for (const Program& program : programs) {
             if (!program.integratedLoudness) {
                 std::cerr << "  " << timeOfDay(program.startTenths) << ' '
                           << program.title << ": blocks " << program.blockCount
                           << '/' << program.expectedBlockCount << '\n';
+            }
+        }
+        if (!audioResult.warnings.empty()) {
+            std::cerr << "WARNING: " << audioResult.warnings.size()
+                      << " programme audio files could not be created:\n";
+            for (const std::string& warning : audioResult.warnings) {
+                std::cerr << "  " << warning << '\n';
             }
         }
         return 2;
