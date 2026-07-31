@@ -3,8 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
+    <meta id="theme-color" name="theme-color" content="#fbf1c7" />
     <title>Loudness Console</title>
+    <script>
+      try {
+        const theme = localStorage.getItem("loudness-theme");
+        document.documentElement.dataset.theme =
+          theme === "dark" ? "dark" : "light";
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -22,6 +32,9 @@
         <nav aria-label="주 메뉴">
           <button class="nav-item active" data-view="dashboard">
             <span class="nav-icon">◫</span>대시보드
+          </button>
+          <button class="nav-item" data-view="calendar">
+            <span class="nav-icon">□</span>채널 캘린더
           </button>
           <button class="nav-item" data-view="schedule">
             <span class="nav-icon">≡</span>편성표
@@ -47,6 +60,10 @@
           </div>
           <div class="top-actions">
             <span id="global-message" class="global-message" hidden></span>
+            <button id="theme-toggle" class="theme-toggle" type="button">
+              <span id="theme-toggle-icon" aria-hidden="true">☾</span>
+              <span id="theme-toggle-label">다크</span>
+            </button>
             <button id="refresh-view" class="icon-button" title="새로고침">↻</button>
           </div>
         </header>
@@ -105,6 +122,101 @@
                 <button class="text-button" data-view-link="reports">전체 보기</button>
               </div>
               <div id="recent-reports" class="file-list empty">리포트가 없습니다.</div>
+            </article>
+          </div>
+        </section>
+
+        <section id="calendar-view" class="view">
+          <div class="calendar-toolbar panel">
+            <label>
+              채널
+              <select id="calendar-channel"></select>
+            </label>
+            <div class="calendar-navigation">
+              <button id="calendar-prev" class="icon-button" title="이전 달">‹</button>
+              <strong id="calendar-month-title">—</strong>
+              <button id="calendar-next" class="icon-button" title="다음 달">›</button>
+              <button id="calendar-today" class="button ghost">이번 달</button>
+            </div>
+            <div class="calendar-legend">
+              <span class="recording">녹음</span>
+              <span class="schedule">편성</span>
+              <span class="report">리포트</span>
+              <span class="audio">오디오</span>
+            </div>
+          </div>
+
+          <div class="calendar-layout">
+            <article class="panel month-calendar-panel">
+              <div class="calendar-weekdays" aria-hidden="true">
+                <span>일</span><span>월</span><span>화</span><span>수</span>
+                <span>목</span><span>금</span><span>토</span>
+              </div>
+              <div id="calendar-grid" class="calendar-grid">
+                <div class="calendar-loading">달력을 불러오는 중입니다.</div>
+              </div>
+            </article>
+
+            <aside class="panel calendar-day-panel">
+              <p class="eyebrow">SELECTED DAY</p>
+              <h2 id="calendar-day-title">날짜를 선택하세요</h2>
+              <p id="calendar-day-channel" class="muted">채널별 작업 상태가 표시됩니다.</p>
+              <div id="calendar-day-status" class="calendar-day-status">
+                <div><span>녹음 데이터</span><strong>—</strong></div>
+                <div><span>편성표</span><strong>—</strong></div>
+                <div><span>리포트</span><strong>—</strong></div>
+                <div><span>편성 오디오</span><strong>—</strong></div>
+              </div>
+              <div class="calendar-day-actions">
+                <button id="calendar-open-schedule" class="button secondary" disabled>
+                  편성표 열기
+                </button>
+                <button id="calendar-fetch-schedule" class="button ghost" disabled>
+                  API 편성표 받기
+                </button>
+                <button id="calendar-create-report" class="button primary" disabled>
+                  리포트 생성
+                </button>
+                <a id="calendar-download-report" class="button secondary" hidden>
+                  리포트 다운로드
+                </a>
+              </div>
+              <small class="calendar-help">
+                리포트 생성 후 편성 오디오는 백그라운드 큐에서 처리됩니다.
+              </small>
+            </aside>
+          </div>
+
+          <div id="calendar-detail" class="calendar-detail-grid">
+            <article class="panel calendar-schedule-preview">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">DAY SCHEDULE</p>
+                  <h2 id="calendar-detail-title">선택 날짜 편성표</h2>
+                </div>
+                <button
+                  id="calendar-detail-open-schedule"
+                  class="text-button"
+                  disabled
+                >
+                  편집 화면 열기
+                </button>
+              </div>
+              <div id="calendar-schedule-preview" class="calendar-preview-empty">
+                날짜를 선택하면 편성표가 표시됩니다.
+              </div>
+            </article>
+
+            <article class="panel calendar-report-preview">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">DAY REPORT</p>
+                  <h2>리포트와 오디오</h2>
+                </div>
+              </div>
+              <div id="calendar-report-preview" class="calendar-preview-empty">
+                날짜를 선택하면 리포트 상태가 표시됩니다.
+              </div>
             </article>
           </div>
         </section>
@@ -218,6 +330,21 @@
               <div id="scheduler-status" class="scheduler-status">
                 최근 자동 실행 기록이 없습니다.
               </div>
+              <div class="retention-settings">
+                <div class="retention-settings-copy">
+                  <p class="eyebrow">RETENTION POLICY</p>
+                  <h3>채널별 파일 보관기간</h3>
+                  <small>
+                    WAV, M-LKFS, 리포트와 로그의 보관기간을 별도 창에서 관리합니다.
+                  </small>
+                </div>
+                <button id="open-retention-settings" class="button secondary" type="button">
+                  보관기간 설정
+                </button>
+                <div id="cleanup-status" class="scheduler-status">
+                  최근 자동 정리 기록이 없습니다.
+                </div>
+              </div>
             </div>
             <div id="channel-settings" class="channel-settings"></div>
             <div class="settings-actions">
@@ -237,6 +364,50 @@
       <pre id="job-log"></pre>
       <div class="dialog-actions">
         <button id="download-job-report" class="button primary" hidden>리포트 다운로드</button>
+      </div>
+    </dialog>
+
+    <dialog id="retention-dialog" class="retention-dialog">
+      <div class="dialog-head">
+        <div>
+          <p class="eyebrow">RETENTION POLICY</p>
+          <h2>파일 보관기간 설정</h2>
+        </div>
+        <button id="close-retention" class="icon-button" type="button">×</button>
+      </div>
+      <div class="retention-dialog-body">
+        <label class="retention-channel-select">
+          설정할 채널
+          <select id="retention-channel"></select>
+        </label>
+        <div class="retention-dialog-grid">
+          <label>원본 WAV<span class="retention-input"><input id="retention-wav" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>M-LKFS CSV<span class="retention-input"><input id="retention-mlkfs" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>편성별 오디오<span class="retention-input"><input id="retention-program-audio" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>편성표 JSON<span class="retention-input"><input id="retention-schedules" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>리포트 XLSX<span class="retention-input"><input id="retention-reports" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>레코더 로그<span class="retention-input"><input id="retention-recorder-logs" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+        </div>
+        <div class="retention-common">
+          <div>
+            <strong>공통 웹 운영 로그</strong>
+            <small>logs/web.log는 모든 채널이 함께 사용하는 서버 로그입니다.</small>
+          </div>
+          <label>
+            보관기간
+            <span class="retention-input">
+              <input id="retention-web-logs" type="number" min="0" max="3650" step="1" />
+              <span>일</span>
+            </span>
+          </label>
+        </div>
+        <p class="retention-dialog-help">
+          0일은 자동 삭제하지 않습니다. 변경한 값은 설정 화면의
+          ‘설정 저장’을 눌러야 서버에 저장됩니다.
+        </p>
+      </div>
+      <div class="dialog-actions">
+        <button id="confirm-retention" class="button primary" type="button">확인</button>
       </div>
     </dialog>
 

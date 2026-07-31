@@ -1,11 +1,13 @@
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import {
   mkdir,
   readFile,
   readdir,
   rename,
+  rm,
   stat,
   statfs,
+  truncate,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -13,7 +15,9 @@ import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { createGzip, inflateRawSync } from "node:zlib";
 
 const webDirectory = dirname(fileURLToPath(import.meta.url));
 const projectDirectory = resolve(webDirectory, "..");
@@ -30,6 +34,7 @@ const serverSettings = Object.freeze({
   scheduleApi: "http://10.110.21.31/cms/api/frmtn/dailyInfo.json",
   runtimeSettingsFile: join(webDirectory, "settings.json"),
   schedulerStateFile: join(webDirectory, "scheduler-state.json"),
+  logsDirectory: join(projectDirectory, "logs"),
 });
 
 const config = Object.freeze({
@@ -41,6 +46,7 @@ const config = Object.freeze({
   reportExecutable: resolve(serverSettings.reportExecutable),
   runtimeSettingsFile: resolve(serverSettings.runtimeSettingsFile),
   schedulerStateFile: resolve(serverSettings.schedulerStateFile),
+  logsDirectory: resolve(serverSettings.logsDirectory),
 });
 
 const defaultRuntimeSettings = Object.freeze({
@@ -49,24 +55,54 @@ const defaultRuntimeSettings = Object.freeze({
     enabled: true,
     timeKst: "08:00",
   },
+  maintenance: {
+    webLogsDays: 0,
+  },
   channels: [
     {
       id: "decklink2",
       name: "DeckLink 2",
       recordingsDirectory: "/mnt/hdd/recordings/decklink2",
+      recorderLogName: "recorder-port2.log",
       reportEnabled: true,
+      retention: {
+        wavDays: 0,
+        mlkfsDays: 0,
+        programAudioDays: 0,
+        schedulesDays: 0,
+        reportsDays: 0,
+        recorderLogsDays: 0,
+      },
     },
     {
       id: "decklink3",
       name: "DeckLink 3",
       recordingsDirectory: "/mnt/hdd/recordings/decklink3",
+      recorderLogName: "recorder-port3.log",
       reportEnabled: true,
+      retention: {
+        wavDays: 0,
+        mlkfsDays: 0,
+        programAudioDays: 0,
+        schedulesDays: 0,
+        reportsDays: 0,
+        recorderLogsDays: 0,
+      },
     },
     {
       id: "decklink4",
       name: "DeckLink 4",
       recordingsDirectory: "/mnt/hdd/recordings/decklink4",
+      recorderLogName: "recorder-port4.log",
       reportEnabled: false,
+      retention: {
+        wavDays: 0,
+        mlkfsDays: 0,
+        programAudioDays: 0,
+        schedulesDays: 0,
+        reportsDays: 0,
+        recorderLogsDays: 0,
+      },
     },
   ],
 });
@@ -82,6 +118,7 @@ await Promise.all([
   mkdir(config.schedulesDirectory, { recursive: true }),
   mkdir(config.reportsDirectory, { recursive: true }),
   mkdir(config.programAudioDirectory, { recursive: true }),
+  mkdir(config.logsDirectory, { recursive: true }),
 ]);
 let runtimeSettings = await loadRuntimeSettings();
 let schedulerState = await loadSchedulerState();
@@ -122,6 +159,42 @@ function validateRuntimeSettings(value) {
   if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(reportSchedule.timeKst)) {
     throw httpError(400, "자동 리포트 실행 시각이 올바르지 않습니다.");
   }
+  const rawMaintenance = value.maintenance || {};
+  const webLogsDays = Number(rawMaintenance.webLogsDays ?? 0);
+  if (
+    !Number.isInteger(webLogsDays) ||
+    webLogsDays < 0 ||
+    webLogsDays > 3650
+  ) {
+    throw httpError(400, "웹 운영 로그 보관기간은 0~3650일의 정수여야 합니다.");
+  }
+  const maintenance = { webLogsDays };
+  const legacyRetention = value.retention || {};
+  const validateRetention = (raw, channelName) => {
+    const retentionValue = (name, label, fallback = 0) => {
+      const days = Number(raw?.[name] ?? fallback);
+      if (!Number.isInteger(days) || days < 0 || days > 3650) {
+        throw httpError(
+          400,
+          `${channelName} ${label} 보관기간은 0~3650일의 정수여야 합니다.`,
+        );
+      }
+      return days;
+    };
+    const legacyRecordingsDays = raw?.recordingsDays ?? 0;
+    return {
+      wavDays: retentionValue("wavDays", "원본 WAV", legacyRecordingsDays),
+      mlkfsDays: retentionValue(
+        "mlkfsDays",
+        "M-LKFS CSV",
+        legacyRecordingsDays,
+      ),
+      programAudioDays: retentionValue("programAudioDays", "편성 오디오"),
+      schedulesDays: retentionValue("schedulesDays", "편성표"),
+      reportsDays: retentionValue("reportsDays", "리포트"),
+      recorderLogsDays: retentionValue("recorderLogsDays", "레코더 로그"),
+    };
+  };
   if (
     !Array.isArray(value.channels) ||
     value.channels.length < 1 ||
@@ -137,6 +210,9 @@ function validateRuntimeSettings(value) {
     const name = String(channel?.name || "").trim();
     const recordingsDirectory = String(
       channel?.recordingsDirectory || "",
+    ).trim();
+    const recorderLogName = String(
+      channel?.recorderLogName || defaultRecorderLogName(id),
     ).trim();
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) {
       throw httpError(400, `${index + 1}번 채널 ID가 올바르지 않습니다.`);
@@ -160,15 +236,30 @@ function validateRuntimeSettings(value) {
     if (!isAbsolute(recordingsDirectory)) {
       throw httpError(400, `${name}의 녹음 경로는 절대경로여야 합니다.`);
     }
+    if (
+      !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.log$/.test(recorderLogName) ||
+      recorderLogName === "web.log"
+    ) {
+      throw httpError(
+        400,
+        `${name}의 레코더 로그 파일명이 올바르지 않습니다.`,
+      );
+    }
     const reportEnabled =
       typeof channel.reportEnabled === "boolean"
         ? channel.reportEnabled
         : id === legacyReportChannelId;
+    const retention = validateRetention(
+      channel.retention || legacyRetention,
+      name,
+    );
     return {
       id,
       name,
       recordingsDirectory: resolve(recordingsDirectory),
+      recorderLogName,
       reportEnabled,
+      retention,
     };
   });
   if (!channels.some((channel) => channel.reportEnabled)) {
@@ -177,8 +268,14 @@ function validateRuntimeSettings(value) {
   return {
     scheduleApi: parsedScheduleApi.toString(),
     reportSchedule,
+    maintenance,
     channels,
   };
+}
+
+function defaultRecorderLogName(channelId) {
+  const port = /(\d+)$/.exec(channelId)?.[1];
+  return port ? `recorder-port${port}.log` : `recorder-${channelId}.log`;
 }
 
 async function verifyChannelDirectories(settings) {
@@ -235,6 +332,16 @@ async function loadSchedulerState() {
       finishedAt:
         typeof value.finishedAt === "string" ? value.finishedAt : null,
       results: Array.isArray(value.results) ? value.results : [],
+      lastCleanupDateKst:
+        typeof value.lastCleanupDateKst === "string"
+          ? value.lastCleanupDateKst
+          : null,
+      lastCleanupAt:
+        typeof value.lastCleanupAt === "string" ? value.lastCleanupAt : null,
+      cleanupResult:
+        value.cleanupResult && typeof value.cleanupResult === "object"
+          ? value.cleanupResult
+          : null,
     };
   } catch (error) {
     if (error?.code !== "ENOENT") {
@@ -247,6 +354,9 @@ async function loadSchedulerState() {
       startedAt: null,
       finishedAt: null,
       results: [],
+      lastCleanupDateKst: null,
+      lastCleanupAt: null,
+      cleanupResult: null,
     };
   }
 }
@@ -290,8 +400,117 @@ function reportPath(channel, date) {
   );
 }
 
+async function existingReportPath(channel, date) {
+  const current = reportPath(channel, date);
+  try {
+    await stat(current);
+    return current;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const legacy = join(
+    config.reportsDirectory,
+    `${channel.id}_Loudness_Report_${date}.xlsx`,
+  );
+  try {
+    await stat(legacy);
+    return legacy;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw httpError(404, "생성된 리포트가 없습니다.");
+    }
+    throw error;
+  }
+}
+
 function programAudioPath(channel, date) {
   return join(config.programAudioDirectory, channelFileName(channel), date);
+}
+
+function zipEntry(archive, targetName) {
+  let offset = 0;
+  while (offset + 30 <= archive.length) {
+    if (archive.readUInt32LE(offset) !== 0x04034b50) break;
+    const flags = archive.readUInt16LE(offset + 6);
+    const method = archive.readUInt16LE(offset + 8);
+    const compressedSize = archive.readUInt32LE(offset + 18);
+    const nameLength = archive.readUInt16LE(offset + 26);
+    const extraLength = archive.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const dataStart = nameStart + nameLength + extraLength;
+    const dataEnd = dataStart + compressedSize;
+    if (dataEnd > archive.length || (flags & 0x08) !== 0) {
+      throw new Error("지원하지 않는 XLSX ZIP 구조입니다.");
+    }
+    const name = archive.toString("utf8", nameStart, nameStart + nameLength);
+    if (name === targetName) {
+      const data = archive.subarray(dataStart, dataEnd);
+      if (method === 0) return data;
+      if (method === 8) return inflateRawSync(data);
+      throw new Error(`지원하지 않는 XLSX 압축 방식입니다: ${method}`);
+    }
+    offset = dataEnd;
+  }
+  throw new Error(`XLSX 내부 파일을 찾을 수 없습니다: ${targetName}`);
+}
+
+function decodeXmlText(value) {
+  return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCodePoint(Number.parseInt(code, 16)),
+    )
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCodePoint(Number(code)),
+    )
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function worksheetCell(rowXml, column, rowNumber) {
+  const pattern = new RegExp(
+    `<c\\b[^>]*r="${column}${rowNumber}"[^>]*>([\\s\\S]*?)<\\/c>`,
+  );
+  const cell = pattern.exec(rowXml)?.[1];
+  if (!cell) return null;
+  const inline = /<t\b[^>]*>([\s\S]*?)<\/t>/.exec(cell)?.[1];
+  if (inline !== undefined) return decodeXmlText(inline);
+  const number = /<v>([\s\S]*?)<\/v>/.exec(cell)?.[1];
+  return number === undefined ? null : decodeXmlText(number);
+}
+
+async function readReportData(channel, date) {
+  const path = await existingReportPath(channel, date);
+  const archive = await readFile(path);
+  const worksheet = zipEntry(
+    archive,
+    "xl/worksheets/sheet1.xml",
+  ).toString("utf8");
+  const rows = [];
+  const rowPattern = /<row\b[^>]*r="(\d+)"[^>]*>([\s\S]*?)<\/row>/g;
+  for (const match of worksheet.matchAll(rowPattern)) {
+    const rowNumber = Number(match[1]);
+    if (rowNumber === 1) continue;
+    const ilkfsText = worksheetCell(match[2], "D", rowNumber);
+    rows.push({
+      index: rowNumber - 1,
+      startTime: worksheetCell(match[2], "A", rowNumber),
+      endTime: worksheetCell(match[2], "B", rowNumber),
+      duration: worksheetCell(match[2], "C", rowNumber),
+      ilkfs:
+        ilkfsText === null || !Number.isFinite(Number(ilkfsText))
+          ? null
+          : Number(ilkfsText),
+      title: worksheetCell(match[2], "E", rowNumber),
+      programId: worksheetCell(match[2], "F", rowNumber),
+    });
+  }
+  return {
+    reportName: path.split(sep).at(-1),
+    rows,
+  };
 }
 
 function requireDate(value) {
@@ -306,6 +525,83 @@ function requireDate(value) {
     throw httpError(400, "유효하지 않은 날짜입니다.");
   }
   return value;
+}
+
+function requireMonth(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}$/.test(value)) {
+    throw httpError(400, "월은 YYYY-MM 형식이어야 합니다.");
+  }
+  const parsed = new Date(`${value}-01T00:00:00Z`);
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.toISOString().slice(0, 7) !== value
+  ) {
+    throw httpError(400, "유효하지 않은 월입니다.");
+  }
+  return value;
+}
+
+async function directoryNames(directory) {
+  try {
+    return await readdir(directory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function calendarMonth(channel, month) {
+  const [scheduleNames, reportNames, recordingNames, audioDates] =
+    await Promise.all([
+      directoryNames(config.schedulesDirectory),
+      directoryNames(config.reportsDirectory),
+      directoryNames(channel.recordingsDirectory),
+      directoryNames(join(config.programAudioDirectory, channelFileName(channel))),
+    ]);
+  const schedules = new Set(scheduleNames);
+  const reports = new Set(reportNames);
+  const recordingDates = new Set(
+    recordingNames
+      .map((name) => name.slice(0, 10))
+      .filter((date) => date.startsWith(month)),
+  );
+  const audioDateSet = new Set(audioDates);
+  const year = Number(month.slice(0, 4));
+  const monthNumber = Number(month.slice(5, 7));
+  const dayCount = new Date(Date.UTC(year, monthNumber, 0)).getUTCDate();
+  const days = [];
+  for (let day = 1; day <= dayCount; ++day) {
+    const date = `${month}-${String(day).padStart(2, "0")}`;
+    const scheduleName = schedulePath(channel, date).split(sep).at(-1);
+    const legacyScheduleName = `${channel.id}_Schedule_${date}.json`;
+    const reportName = reportPath(channel, date).split(sep).at(-1);
+    const legacyReportName = `${channel.id}_Loudness_Report_${date}.xlsx`;
+    const storedReportName = reports.has(reportName)
+      ? reportName
+      : reports.has(legacyReportName)
+        ? legacyReportName
+        : null;
+    const audioJob = [...audioJobs.values()]
+      .filter((job) => job.channelId === channel.id && job.date === date)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
+    days.push({
+      date,
+      hasRecording: recordingDates.has(date),
+      hasSchedule:
+        schedules.has(scheduleName) || schedules.has(legacyScheduleName),
+      hasReport: storedReportName !== null,
+      hasAudio: audioDateSet.has(date),
+      audioJobState: audioJob?.state || null,
+      reportName: storedReportName,
+    });
+  }
+  return {
+    channelId: channel.id,
+    channelName: channel.name,
+    month,
+    firstWeekday: new Date(`${month}-01T00:00:00Z`).getUTCDay(),
+    days,
+  };
 }
 
 function validateSchedule(value, date) {
@@ -365,7 +661,7 @@ async function atomicWriteJson(path, value) {
 
 async function readSchedule(channel, date) {
   try {
-    const text = await readFile(schedulePath(channel, date), "utf8");
+    const text = await readFile(await existingSchedulePath(channel, date), "utf8");
     return validateSchedule(JSON.parse(text), date);
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -373,6 +669,31 @@ async function readSchedule(channel, date) {
     }
     if (error instanceof SyntaxError) {
       throw httpError(500, "저장된 편성표 JSON을 해석할 수 없습니다.");
+    }
+    throw error;
+  }
+}
+
+async function existingSchedulePath(channel, date) {
+  const current = schedulePath(channel, date);
+  try {
+    await stat(current);
+    return current;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const legacy = join(
+    config.schedulesDirectory,
+    `${channel.id}_Schedule_${date}.json`,
+  );
+  try {
+    await stat(legacy);
+    return legacy;
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      const missing = new Error("저장된 편성표가 없습니다.");
+      missing.code = "ENOENT";
+      throw missing;
     }
     throw error;
   }
@@ -652,7 +973,7 @@ async function runNextAudioJob() {
 }
 
 async function startReportJob(channel, date) {
-  await readSchedule(channel, date);
+  const inputSchedulePath = await existingSchedulePath(channel, date);
   for (const job of jobs.values()) {
     if (job.state === "running" || job.state === "queued") {
       throw httpError(409, "이미 리포트 계산 작업이 실행 중입니다.");
@@ -677,6 +998,11 @@ async function startReportJob(channel, date) {
     job.resolveCompletion = resolveCompletion;
   });
   jobs.set(id, job);
+  while (jobs.size > 100) {
+    const oldest = jobs.keys().next().value;
+    if (["queued", "running"].includes(jobs.get(oldest)?.state)) break;
+    jobs.delete(oldest);
+  }
 
   const args = [
     "--date",
@@ -684,7 +1010,7 @@ async function startReportJob(channel, date) {
     "--recordings",
     channel.recordingsDirectory,
     "--schedule-json",
-    schedulePath(channel, date),
+    inputSchedulePath,
     "--schedule-output",
     schedulePath(channel, date),
     "--output",
@@ -748,6 +1074,335 @@ function previousDate(date) {
   return value.toISOString().slice(0, 10);
 }
 
+function dateDaysBefore(date, days) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() - days);
+  return value.toISOString().slice(0, 10);
+}
+
+function validFileDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return (
+    !Number.isNaN(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === value
+  );
+}
+
+function protectedJobDates() {
+  const dates = new Set();
+  for (const job of [...jobs.values(), ...audioJobs.values()]) {
+    if (["queued", "running"].includes(job.state)) dates.add(job.date);
+  }
+  return dates;
+}
+
+function mergeRetentionDays(policies, key, days) {
+  const previous = policies.get(key);
+  policies.set(
+    key,
+    previous === undefined
+      ? days
+      : previous === 0 || days === 0
+        ? 0
+        : Math.max(previous, days),
+  );
+}
+
+async function cleanupFlatFiles({
+  directory,
+  days,
+  runDate,
+  pattern,
+  category,
+  result,
+  protectedDates,
+}) {
+  if (days === 0) return;
+  const cutoff = dateDaysBefore(runDate, days);
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    result.errors.push(`${category}: ${error.message}`);
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const date = pattern.exec(entry.name)?.[1];
+    if (
+      !date ||
+      !validFileDate(date) ||
+      date >= cutoff ||
+      protectedDates.has(date)
+    ) {
+      continue;
+    }
+    const path = join(directory, entry.name);
+    try {
+      const info = await stat(path);
+      await unlink(path);
+      result[category].files += 1;
+      result[category].bytes += info.size;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        result.errors.push(`${path}: ${error.message}`);
+      }
+    }
+  }
+}
+
+async function cleanupProgramAudio({
+  channel,
+  days,
+  runDate,
+  result,
+  protectedDates,
+}) {
+  if (days === 0) return;
+  const cutoff = dateDaysBefore(runDate, days);
+  const channelDirectory = join(
+    config.programAudioDirectory,
+    channelFileName(channel),
+  );
+  let dateDirectories;
+  try {
+    dateDirectories = await readdir(channelDirectory, {
+      withFileTypes: true,
+    });
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    result.errors.push(`${channelDirectory}: ${error.message}`);
+    return;
+  }
+  for (const dateEntry of dateDirectories) {
+    const date = dateEntry.name;
+    if (
+      !dateEntry.isDirectory() ||
+      !validFileDate(date) ||
+      date >= cutoff ||
+      protectedDates.has(date)
+    ) {
+      continue;
+    }
+    const path = join(channelDirectory, date);
+    try {
+      await rm(path, { recursive: true, force: false });
+      result.programAudio.directories += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        result.errors.push(`${path}: ${error.message}`);
+      }
+    }
+  }
+}
+
+async function nextLogArchivePath(logName, runDate) {
+  for (let part = 1; part <= 999; ++part) {
+    const suffix = part === 1 ? "" : `_part${String(part).padStart(2, "0")}`;
+    const path = join(
+      config.logsDirectory,
+      `${logName}.${runDate}${suffix}.gz`,
+    );
+    try {
+      await stat(path);
+    } catch (error) {
+      if (error?.code === "ENOENT") return path;
+      throw error;
+    }
+  }
+  throw new Error(`${logName}의 로그 압축 파일 번호가 모두 사용 중입니다.`);
+}
+
+async function rotateOperationalLog(logName, runDate, result) {
+  const source = join(config.logsDirectory, logName);
+  let sourceInfo;
+  try {
+    sourceInfo = await stat(source);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    result.errors.push(`${source}: ${error.message}`);
+    return;
+  }
+  if (!sourceInfo.isFile() || sourceInfo.size === 0) return;
+  let archive;
+  try {
+    archive = await nextLogArchivePath(logName, runDate);
+    await pipeline(
+      createReadStream(source),
+      createGzip({ level: 6 }),
+      createWriteStream(archive, { flags: "wx", mode: 0o640 }),
+    );
+    await truncate(source, 0);
+    const archiveInfo = await stat(archive);
+    result.operationalLogs.rotatedFiles += 1;
+    result.operationalLogs.sourceBytes += sourceInfo.size;
+    result.operationalLogs.archiveBytes += archiveInfo.size;
+  } catch (error) {
+    if (archive) {
+      try {
+        await unlink(archive);
+      } catch {
+        // Report the original rotation error.
+      }
+    }
+    result.errors.push(`${source}: ${error.message}`);
+  }
+}
+
+async function cleanupOperationalLogs(runDate, result) {
+  const policies = new Map([["web.log", runtimeSettings.maintenance.webLogsDays]]);
+  for (const channel of runtimeSettings.channels) {
+    mergeRetentionDays(
+      policies,
+      channel.recorderLogName,
+      channel.retention.recorderLogsDays,
+    );
+  }
+  for (const [logName, days] of policies) {
+    await rotateOperationalLog(logName, runDate, result);
+    await cleanupFlatFiles({
+      directory: config.logsDirectory,
+      days,
+      runDate,
+      pattern: new RegExp(
+        `^${escapeRegExp(logName)}\\.(\\d{4}-\\d{2}-\\d{2})` +
+          `(?:_part\\d+)?\\.gz$`,
+      ),
+      category: "operationalLogs",
+      result,
+      protectedDates: new Set(),
+    });
+  }
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function runScheduledCleanup(runDateKst) {
+  const result = {
+    runDateKst,
+    maintenancePolicy: runtimeSettings.maintenance,
+    channelPolicies: runtimeSettings.channels.map((channel) => ({
+      channelId: channel.id,
+      channelName: channel.name,
+      recorderLogName: channel.recorderLogName,
+      retention: channel.retention,
+    })),
+    recordingWav: { files: 0, bytes: 0 },
+    mlkfs: { files: 0, bytes: 0 },
+    programAudio: { directories: 0 },
+    schedules: { files: 0, bytes: 0 },
+    reports: { files: 0, bytes: 0 },
+    operationalLogs: {
+      rotatedFiles: 0,
+      sourceBytes: 0,
+      archiveBytes: 0,
+      files: 0,
+      bytes: 0,
+    },
+    errors: [],
+  };
+  const protectedDates = protectedJobDates();
+  const wavPolicies = new Map();
+  const mlkfsPolicies = new Map();
+  for (const channel of runtimeSettings.channels) {
+    mergeRetentionDays(
+      wavPolicies,
+      channel.recordingsDirectory,
+      channel.retention.wavDays,
+    );
+    mergeRetentionDays(
+      mlkfsPolicies,
+      channel.recordingsDirectory,
+      channel.retention.mlkfsDays,
+    );
+  }
+  for (const [directory, days] of wavPolicies) {
+    await cleanupFlatFiles({
+      directory,
+      days,
+      runDate: runDateKst,
+      pattern:
+        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}(?:_part\d+)?\.wav$/,
+      category: "recordingWav",
+      result,
+      protectedDates,
+    });
+  }
+  for (const [directory, days] of mlkfsPolicies) {
+    await cleanupFlatFiles({
+      directory,
+      days,
+      runDate: runDateKst,
+      pattern:
+        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}_mlkfs(?:_part\d+)?\.csv$/,
+      category: "mlkfs",
+      result,
+      protectedDates,
+    });
+  }
+  for (const channel of runtimeSettings.channels) {
+    await cleanupProgramAudio({
+      channel,
+      days: channel.retention.programAudioDays,
+      runDate: runDateKst,
+      result,
+      protectedDates,
+    });
+    const filePrefixes = [
+      channelFileName(channel),
+      channel.id,
+    ].map(escapeRegExp).join("|");
+    await cleanupFlatFiles({
+      directory: config.schedulesDirectory,
+      days: channel.retention.schedulesDays,
+      runDate: runDateKst,
+      pattern: new RegExp(
+        `^(?:${filePrefixes})_Schedule_(\\d{4}-\\d{2}-\\d{2})\\.json$`,
+      ),
+      category: "schedules",
+      result,
+      protectedDates,
+    });
+    await cleanupFlatFiles({
+      directory: config.reportsDirectory,
+      days: channel.retention.reportsDays,
+      runDate: runDateKst,
+      pattern: new RegExp(
+        `^(?:${filePrefixes})_Loudness_Report_(\\d{4}-\\d{2}-\\d{2})\\.xlsx$`,
+      ),
+      category: "reports",
+      result,
+      protectedDates,
+    });
+  }
+  await cleanupOperationalLogs(runDateKst, result);
+  if (result.errors.length > 100) {
+    result.errors = [
+      ...result.errors.slice(0, 100),
+      `그 밖의 오류 ${result.errors.length - 100}개`,
+    ];
+  }
+  schedulerState.lastCleanupDateKst = runDateKst;
+  schedulerState.lastCleanupAt = new Date().toISOString();
+  schedulerState.cleanupResult = result;
+  await saveSchedulerState();
+  console.log(
+    "보관기간 정리 완료: " +
+      `WAV ${result.recordingWav.files}개, ` +
+      `M-LKFS ${result.mlkfs.files}개, ` +
+      `편성 오디오 ${result.programAudio.directories}일, ` +
+      `편성표 ${result.schedules.files}개, ` +
+      `리포트 ${result.reports.files}개, ` +
+      `로그 압축 ${result.operationalLogs.rotatedFiles}개, ` +
+      `오류 ${result.errors.length}개`,
+  );
+  return result;
+}
+
 function hasActiveReportJob() {
   return [...jobs.values()].some((job) =>
     ["queued", "running"].includes(job.state),
@@ -765,6 +1420,7 @@ async function runScheduledReports(runDateKst, broadcastDate) {
     (channel) => channel.reportEnabled,
   );
   schedulerState = {
+    ...schedulerState,
     lastAttemptDateKst: runDateKst,
     broadcastDate,
     status: "running",
@@ -823,15 +1479,16 @@ async function runScheduledReports(runDateKst, broadcastDate) {
 async function checkReportSchedule() {
   if (schedulerBusy || !runtimeSettings.reportSchedule.enabled) return;
   const now = kstNowParts();
-  if (
-    now.time < runtimeSettings.reportSchedule.timeKst ||
-    schedulerState.lastAttemptDateKst === now.date
-  ) {
-    return;
-  }
+  if (now.time < runtimeSettings.reportSchedule.timeKst) return;
+  const cleanupDue = schedulerState.lastCleanupDateKst !== now.date;
+  const reportDue = schedulerState.lastAttemptDateKst !== now.date;
+  if (!cleanupDue && !reportDue) return;
   schedulerBusy = true;
   try {
-    await runScheduledReports(now.date, previousDate(now.date));
+    if (cleanupDue) await runScheduledCleanup(now.date);
+    if (reportDue) {
+      await runScheduledReports(now.date, previousDate(now.date));
+    }
   } catch (error) {
     console.error(`자동 리포트 스케줄러 오류: ${error.stack || error.message}`);
   } finally {
@@ -942,6 +1599,11 @@ async function route(request, response) {
     const date = requireDate(url.searchParams.get("date"));
     return sendJson(response, 200, await readSchedule(channel, date));
   }
+  if (request.method === "GET" && pathname === "/api/calendar") {
+    const channel = requireChannel(url.searchParams.get("channelId"), true);
+    const month = requireMonth(url.searchParams.get("month"));
+    return sendJson(response, 200, await calendarMonth(channel, month));
+  }
   if (request.method === "POST" && pathname === "/api/schedule/fetch") {
     const body = await readJsonBody(request);
     const channel = requireChannel(body.channelId, true);
@@ -991,6 +1653,11 @@ async function route(request, response) {
         .slice(0, 20)
         .map(publicAudioJob),
     );
+  }
+  if (request.method === "GET" && pathname === "/api/report-data") {
+    const channel = requireChannel(url.searchParams.get("channelId"), true);
+    const date = requireDate(url.searchParams.get("date"));
+    return sendJson(response, 200, await readReportData(channel, date));
   }
   if (request.method === "GET" && pathname === "/api/program-audio") {
     const channel = requireChannel(url.searchParams.get("channelId"), true);

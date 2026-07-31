@@ -210,32 +210,15 @@ http://SERVER_IP:8080
 
 ## 6. 로그 파일 자동 정리
 
-24/7로 실행하면 로그 파일이 계속 커지므로 logrotate를 등록한다.
+별도의 `logrotate` 등록은 필요하지 않다. 웹 설정의 채널별 **레코더 로그**
+보관기간과 공통 **웹 운영 로그** 보관기간을 사용한다. 웹 서버가 자동 리포트
+예약 시각에 현재 `logs/*.log`를 날짜별 `.gz` 파일로 압축하고, 원본 로그를
+비운 뒤 설정 기간보다 오래된 압축 파일을 삭제한다.
 
-```bash
-sudo nano /etc/logrotate.d/loudness-logger
-```
-
-다음 내용을 저장한다.
-
-```text
-/home/duck/Codes/LoudnessLogger2/logs/*.log {
-    daily
-    rotate 30
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-```
-
-로그를 매일 분리하고 최근 30일을 보관하며, 오래된 로그는 gzip으로 압축한다.
-설정이 올바른지는 다음 명령으로 확인할 수 있다.
-
-```bash
-sudo logrotate --debug /etc/logrotate.d/loudness-logger
-```
+레코더 서비스의 `StandardOutput`/`StandardError` 파일명과 웹 설정에 표시되는
+레코더 로그 파일명이 반드시 같아야 한다. 이미
+`/etc/logrotate.d/loudness-logger`를 별도로 등록했다면 이중 회전을 피하도록
+해당 logrotate 설정은 제거한다.
 
 ## 7. 기본 관리 명령
 

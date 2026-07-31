@@ -14,10 +14,41 @@ const state = {
   audioJobTimer: null,
   programAudioTimer: null,
   selectedAudioJobId: "",
+  calendarMonth: "",
+  calendarDate: "",
+  calendarData: null,
+  calendarTimer: null,
+  calendarContentKey: "",
+  calendarContentRequest: 0,
+  previewAudio: null,
+  previewAudioButton: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
+
+function applyTheme(theme, persist = true) {
+  const selected = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = selected;
+  document.documentElement.style.colorScheme = selected;
+  const isLight = selected === "light";
+  $("#theme-toggle-icon").textContent = isLight ? "☾" : "☀";
+  $("#theme-toggle-label").textContent = isLight ? "다크" : "라이트";
+  $("#theme-toggle").title = isLight
+    ? "다크 모드로 전환"
+    : "Gruvbox 라이트 모드로 전환";
+  $("#theme-toggle").setAttribute("aria-label", $("#theme-toggle").title);
+  $("#theme-color").content = isLight ? "#fbf1c7" : "#091018";
+  if (persist) {
+    try {
+      localStorage.setItem("loudness-theme", selected);
+    } catch {
+      // The theme still works when browser storage is unavailable.
+    }
+  }
+}
+
+applyTheme(document.documentElement.dataset.theme, false);
 
 function yesterdayKst() {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -30,6 +61,15 @@ function yesterdayKst() {
   const current = new Date(`${values.year}-${values.month}-${values.day}T00:00:00Z`);
   current.setUTCDate(current.getUTCDate() - 1);
   return current.toISOString().slice(0, 10);
+}
+
+function todayKst() {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 function formatBytes(bytes) {
@@ -80,8 +120,8 @@ function notify(message, isError = false) {
   const node = $("#global-message");
   node.textContent = message;
   node.hidden = false;
-  node.style.color = isError ? "#f5c5c8" : "#b8f1dd";
-  node.style.background = isError ? "#4b2026" : "#143a31";
+  node.classList.toggle("error", isError);
+  node.classList.toggle("success", !isError);
   clearTimeout(notify.timer);
   notify.timer = setTimeout(() => (node.hidden = true), 5000);
 }
@@ -90,10 +130,13 @@ function switchView(view) {
   state.view = view;
   clearInterval(state.audioJobTimer);
   clearInterval(state.programAudioTimer);
+  clearInterval(state.calendarTimer);
   state.audioJobTimer = null;
   state.programAudioTimer = null;
+  state.calendarTimer = null;
   const titles = {
     dashboard: "운영 대시보드",
+    calendar: "채널 캘린더",
     schedule: "편성표 관리",
     reports: "Loudness 리포트",
     settings: "시스템 설정",
@@ -102,6 +145,10 @@ function switchView(view) {
   $$(".nav-item").forEach((node) => node.classList.toggle("active", node.dataset.view === view));
   $("#page-title").textContent = titles[view];
   if (view === "dashboard") loadDashboard();
+  if (view === "calendar") {
+    loadCalendar();
+    state.calendarTimer = setInterval(loadCalendar, 5_000);
+  }
   if (view === "reports") {
     loadReports();
     state.audioJobTimer = setInterval(loadAudioJobs, 1_000);
@@ -141,7 +188,11 @@ async function loadDashboard() {
 
 function updateReportChannelOptions(channels) {
   state.reportChannels = channels;
-  for (const selector of ["#dashboard-channel", "#schedule-channel"]) {
+  for (const selector of [
+    "#dashboard-channel",
+    "#schedule-channel",
+    "#calendar-channel",
+  ]) {
     const select = $(selector);
     const current = select.value;
     select.replaceChildren(
@@ -156,6 +207,449 @@ function updateReportChannelOptions(channels) {
       ? current
       : channels[0]?.id || "";
   }
+}
+
+function shiftMonth(month, amount) {
+  const value = new Date(`${month}-01T00:00:00Z`);
+  value.setUTCMonth(value.getUTCMonth() + amount);
+  return value.toISOString().slice(0, 7);
+}
+
+async function loadCalendar() {
+  const channelId =
+    $("#calendar-channel").value || state.reportChannels[0]?.id || "";
+  if (!channelId) return;
+  if (!state.calendarMonth) state.calendarMonth = todayKst().slice(0, 7);
+  try {
+    const data = await api(
+      `/api/calendar?channelId=${encodeURIComponent(channelId)}` +
+        `&month=${encodeURIComponent(state.calendarMonth)}`,
+    );
+    if (
+      $("#calendar-channel").value !== channelId ||
+      state.calendarMonth !== data.month
+    ) {
+      return;
+    }
+    state.calendarData = data;
+    if (
+      !state.calendarDate ||
+      !state.calendarDate.startsWith(`${data.month}-`)
+    ) {
+      const yesterday = yesterdayKst();
+      state.calendarDate = yesterday.startsWith(`${data.month}-`)
+        ? yesterday
+        : "";
+    }
+    renderCalendar();
+  } catch (error) {
+    notify(error.message, true);
+  }
+}
+
+function renderCalendar() {
+  const data = state.calendarData;
+  if (!data) return;
+  $("#calendar-month-title").textContent =
+    new Intl.DateTimeFormat("ko-KR", {
+      year: "numeric",
+      month: "long",
+      timeZone: "UTC",
+    }).format(new Date(`${data.month}-01T00:00:00Z`));
+  const grid = $("#calendar-grid");
+  const cells = [];
+  for (let index = 0; index < data.firstWeekday; ++index) {
+    const blank = document.createElement("div");
+    blank.className = "calendar-day blank";
+    cells.push(blank);
+  }
+  const today = todayKst();
+  for (const day of data.days) {
+    const button = document.createElement("button");
+    button.className =
+      "calendar-day" +
+      (day.date === today ? " today" : "") +
+      (day.date === state.calendarDate ? " selected" : "");
+    const number = document.createElement("strong");
+    number.textContent = String(Number(day.date.slice(-2)));
+    const marks = document.createElement("div");
+    marks.className = "calendar-marks";
+    const statuses = [
+      ["recording", day.hasRecording, "녹음"],
+      ["schedule", day.hasSchedule, "편성"],
+      ["report", day.hasReport, "리포트"],
+      [
+        "audio",
+        day.hasAudio || ["queued", "running"].includes(day.audioJobState),
+        day.audioJobState === "running"
+          ? "오디오 생성 중"
+          : day.audioJobState === "queued"
+            ? "오디오 대기"
+            : "오디오",
+      ],
+    ];
+    for (const [className, visible, label] of statuses) {
+      if (!visible) continue;
+      const mark = document.createElement("span");
+      mark.className =
+        className +
+        (["queued", "running"].includes(day.audioJobState) &&
+        className === "audio"
+          ? " working"
+          : "");
+      mark.textContent = label;
+      marks.append(mark);
+    }
+    button.append(number, marks);
+    button.addEventListener("click", () => {
+      state.calendarDate = day.date;
+      renderCalendar();
+    });
+    cells.push(button);
+  }
+  while (cells.length % 7 !== 0) {
+    const blank = document.createElement("div");
+    blank.className = "calendar-day blank";
+    cells.push(blank);
+  }
+  grid.replaceChildren(...cells);
+  renderCalendarDay();
+}
+
+function renderCalendarDay() {
+  const day = state.calendarData?.days.find(
+    (candidate) => candidate.date === state.calendarDate,
+  );
+  const buttons = [
+    "#calendar-open-schedule",
+    "#calendar-fetch-schedule",
+    "#calendar-create-report",
+  ];
+  if (!day) {
+    $("#calendar-day-title").textContent = "날짜를 선택하세요";
+    $("#calendar-day-channel").textContent =
+      state.calendarData?.channelName || "채널별 작업 상태가 표시됩니다.";
+    for (const selector of buttons) $(selector).disabled = true;
+    $("#calendar-download-report").hidden = true;
+    renderCalendarDetail(null);
+    return;
+  }
+  $("#calendar-day-title").textContent = new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    weekday: "short",
+    timeZone: "UTC",
+  }).format(new Date(`${day.date}T00:00:00Z`));
+  $("#calendar-day-channel").textContent = state.calendarData.channelName;
+  const audioStatus =
+    day.audioJobState === "running"
+      ? "생성 중"
+      : day.audioJobState === "queued"
+        ? "대기 중"
+        : day.audioJobState === "failed"
+          ? "생성 실패"
+          : day.audioJobState === "warning"
+            ? "일부 누락"
+            : day.hasAudio
+              ? "완료"
+              : "없음";
+  const values = [
+    day.hasRecording ? "있음" : "없음",
+    day.hasSchedule ? "저장됨" : "없음",
+    day.hasReport ? "완료" : "없음",
+    audioStatus,
+  ];
+  $$("#calendar-day-status strong").forEach((node, index) => {
+    node.textContent = values[index];
+    node.className =
+      values[index] === "없음" || values[index].includes("실패")
+        ? "missing"
+        : values[index].includes("중") || values[index] === "대기 중"
+          ? "working"
+          : "ready";
+  });
+  $("#calendar-open-schedule").disabled = !day.hasSchedule;
+  $("#calendar-fetch-schedule").disabled = false;
+  $("#calendar-create-report").disabled = !day.hasSchedule;
+  const download = $("#calendar-download-report");
+  download.hidden = !day.hasReport;
+  if (day.reportName) {
+    download.href =
+      `/api/reports/${encodeURIComponent(day.reportName)}/download`;
+  }
+  renderCalendarDetail(day);
+}
+
+function renderCalendarDetail(day) {
+  const scheduleNode = $("#calendar-schedule-preview");
+  const reportNode = $("#calendar-report-preview");
+  const open = $("#calendar-detail-open-schedule");
+  if (!day || !state.calendarData) {
+    state.calendarContentKey = "";
+    scheduleNode.className = "calendar-preview-empty";
+    scheduleNode.textContent = "날짜를 선택하면 편성표가 표시됩니다.";
+    reportNode.className = "calendar-preview-empty";
+    reportNode.textContent = "날짜를 선택하면 리포트 상태가 표시됩니다.";
+    open.disabled = true;
+    return;
+  }
+
+  $("#calendar-detail-title").textContent =
+    `${day.date} · ${state.calendarData.channelName}`;
+  open.disabled = !day.hasSchedule;
+  renderCalendarReportPreview(day);
+
+  const key = [
+    state.calendarData.channelId,
+    day.date,
+    day.hasSchedule,
+    day.reportName || "",
+    day.hasAudio,
+    day.audioJobState || "",
+  ].join(":");
+  if (key === state.calendarContentKey) return;
+  state.calendarContentKey = key;
+  const request = ++state.calendarContentRequest;
+  if (!day.hasSchedule) {
+    scheduleNode.className = "calendar-preview-empty";
+    scheduleNode.textContent =
+      "저장된 편성표가 없습니다. 오른쪽의 ‘API 편성표 받기’를 이용하세요.";
+    return;
+  }
+  scheduleNode.className = "calendar-preview-empty";
+  scheduleNode.textContent = "편성표와 리포트 결과를 불러오는 중입니다.";
+  const channelId = state.calendarData.channelId;
+  const scheduleRequest = api(
+    `/api/schedule?channelId=${encodeURIComponent(channelId)}` +
+      `&date=${encodeURIComponent(day.date)}`,
+  );
+  const reportRequest = day.hasReport
+    ? api(
+        `/api/report-data?channelId=${encodeURIComponent(channelId)}` +
+          `&date=${encodeURIComponent(day.date)}`,
+      ).catch(() => null)
+    : Promise.resolve(null);
+  const audioRequest = api(
+    `/api/program-audio?channelId=${encodeURIComponent(channelId)}` +
+      `&date=${encodeURIComponent(day.date)}`,
+  ).catch(() => []);
+  void Promise.all([scheduleRequest, reportRequest, audioRequest])
+    .then(([schedule, report, audioFiles]) => {
+      if (request !== state.calendarContentRequest) return;
+      renderCalendarSchedulePreview(
+        schedule,
+        report,
+        audioFiles,
+        channelId,
+        day.date,
+      );
+    })
+    .catch((error) => {
+      if (request !== state.calendarContentRequest) return;
+      state.calendarContentKey = "";
+      scheduleNode.className = "calendar-preview-empty";
+      scheduleNode.textContent = `편성표를 열 수 없습니다: ${error.message}`;
+    });
+}
+
+function renderCalendarSchedulePreview(
+  schedule,
+  report,
+  audioFiles,
+  channelId,
+  date,
+) {
+  const container = $("#calendar-schedule-preview");
+  if (state.previewAudio) {
+    state.previewAudio.pause();
+    state.previewAudio = null;
+    state.previewAudioButton = null;
+  }
+  const reportRows = new Map(
+    (report?.rows || []).map((row) => [
+      `${row.startTime}|${row.programId || ""}`,
+      row,
+    ]),
+  );
+  const audioByIndex = new Map();
+  for (const file of audioFiles) {
+    const match = /^(\d{3})_/.exec(file.name);
+    if (!match) continue;
+    const index = Number(match[1]);
+    if (!audioByIndex.has(index)) audioByIndex.set(index, []);
+    audioByIndex.get(index).push(file);
+  }
+  for (const files of audioByIndex.values()) {
+    files.sort((left, right) => left.name.localeCompare(right.name, "ko"));
+  }
+  const table = document.createElement("table");
+  table.className = "calendar-preview-table";
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const label of [
+    "시작",
+    "길이",
+    "편성명",
+    "프로그램 ID",
+    "I-LKFS",
+    "오디오",
+  ]) {
+    const cell = document.createElement("th");
+    cell.textContent = label;
+    headRow.append(cell);
+  }
+  head.append(headRow);
+  const body = document.createElement("tbody");
+  schedule.items.forEach((item, index) => {
+    const row = document.createElement("tr");
+    const startTime = item.StartTime.slice(11);
+    const reportRow = reportRows.get(
+      `${startTime}|${item.ProgramID || ""}`,
+    );
+    const values = [
+      startTime,
+      formatDuration(item.Duration),
+      item.ProgramItemName || "—",
+      item.ProgramID || "—",
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = value;
+      cell.title = value;
+      row.append(cell);
+    }
+    const loudnessCell = document.createElement("td");
+    loudnessCell.className = "calendar-ilkfs";
+    if (Number.isFinite(reportRow?.ilkfs)) {
+      loudnessCell.textContent = `${reportRow.ilkfs.toFixed(2)} LKFS`;
+      loudnessCell.title = `원본 계산값: ${reportRow.ilkfs}`;
+    } else {
+      loudnessCell.textContent = report ? "계산값 없음" : "—";
+      loudnessCell.classList.add("missing");
+    }
+    row.append(loudnessCell);
+
+    const audioCell = document.createElement("td");
+    audioCell.className = "calendar-audio-cell";
+    const files = audioByIndex.get(index + 1) || [];
+    files.forEach((file, partIndex) => {
+      const url =
+        `/api/program-audio/file?channelId=${encodeURIComponent(channelId)}` +
+        `&date=${encodeURIComponent(date)}` +
+        `&name=${encodeURIComponent(file.name)}`;
+      const play = document.createElement("button");
+      play.className = "calendar-audio-play";
+      play.dataset.idleLabel =
+        files.length > 1 ? `▶${partIndex + 1}` : "▶";
+      play.textContent = play.dataset.idleLabel;
+      play.title =
+        files.length > 1
+          ? `오디오 ${partIndex + 1}/${files.length} 재생`
+          : "편성 오디오 재생";
+      play.addEventListener("click", () => {
+        if (state.previewAudioButton === play && state.previewAudio) {
+          if (state.previewAudio.paused) {
+            void state.previewAudio.play();
+            play.textContent = "Ⅱ";
+          } else {
+            state.previewAudio.pause();
+            play.textContent = play.dataset.idleLabel;
+          }
+          return;
+        }
+        if (state.previewAudio) state.previewAudio.pause();
+        if (state.previewAudioButton) {
+          state.previewAudioButton.textContent =
+            state.previewAudioButton.dataset.idleLabel || "▶";
+        }
+        const player = new Audio(url);
+        state.previewAudio = player;
+        state.previewAudioButton = play;
+        play.textContent = "Ⅱ";
+        player.addEventListener("ended", () => {
+          play.textContent = play.dataset.idleLabel;
+          if (state.previewAudio === player) {
+            state.previewAudio = null;
+            state.previewAudioButton = null;
+          }
+        });
+        player.addEventListener("error", () => {
+          play.textContent = play.dataset.idleLabel;
+          notify("편성 오디오를 재생할 수 없습니다.", true);
+        });
+        void player.play().catch(() => {
+          play.textContent = play.dataset.idleLabel;
+        });
+      });
+      const download = document.createElement("a");
+      download.className = "calendar-audio-download";
+      download.textContent = "↓";
+      download.title = "WAV 다운로드";
+      download.href = url;
+      download.download = file.name;
+      audioCell.append(play, download);
+    });
+    if (!files.length) audioCell.textContent = "—";
+    row.append(audioCell);
+    body.append(row);
+  });
+  table.append(head, body);
+  container.className = "calendar-preview-table-wrap";
+  container.replaceChildren(table);
+}
+
+function renderCalendarReportPreview(day) {
+  const container = $("#calendar-report-preview");
+  container.className = "calendar-report-content";
+  container.replaceChildren();
+
+  const reportBlock = document.createElement("div");
+  reportBlock.className = `calendar-artifact ${day.hasReport ? "ready" : ""}`;
+  const reportLabel = document.createElement("span");
+  reportLabel.textContent = "LOUDNESS REPORT";
+  const reportName = document.createElement("strong");
+  reportName.textContent = day.reportName || "생성된 리포트 없음";
+  reportBlock.append(reportLabel, reportName);
+  if (day.reportName) {
+    const download = document.createElement("a");
+    download.className = "text-button";
+    download.textContent = "XLSX 다운로드";
+    download.href =
+      `/api/reports/${encodeURIComponent(day.reportName)}/download`;
+    reportBlock.append(download);
+  }
+
+  const audioBlock = document.createElement("div");
+  const audioWorking = ["queued", "running"].includes(day.audioJobState);
+  audioBlock.className =
+    `calendar-artifact ${day.hasAudio ? "ready" : ""}` +
+    (audioWorking ? " working" : "");
+  const audioLabel = document.createElement("span");
+  audioLabel.textContent = "PROGRAMME AUDIO";
+  const audioState = document.createElement("strong");
+  audioState.textContent =
+    day.audioJobState === "running"
+      ? "백그라운드 생성 중"
+      : day.audioJobState === "queued"
+        ? "작업 대기 중"
+        : day.audioJobState === "failed"
+          ? "생성 실패"
+          : day.audioJobState === "warning"
+            ? "완료 · 일부 누락"
+            : day.hasAudio
+              ? "청취 가능"
+              : "생성된 오디오 없음";
+  audioBlock.append(audioLabel, audioState);
+
+  const action = document.createElement("button");
+  action.className = "button primary";
+  action.textContent = day.hasReport ? "리포트 다시 계산" : "리포트 생성";
+  action.disabled = !day.hasSchedule;
+  action.addEventListener("click", () =>
+    $("#calendar-create-report").click(),
+  );
+  container.append(reportBlock, audioBlock, action);
 }
 
 function renderRecorders(recorders) {
@@ -503,6 +997,7 @@ function showJob(job) {
       if (!["queued", "running"].includes(current.state)) {
         clearInterval(state.jobTimer);
         loadDashboard();
+        if (state.view === "calendar") void loadCalendar();
         if (
           state.channelId === current.channelId &&
           state.date === current.date
@@ -651,6 +1146,85 @@ async function loadSettings() {
   }
 }
 
+const retentionFields = [
+  { key: "wavDays", selector: "#retention-wav", shortLabel: "WAV" },
+  { key: "mlkfsDays", selector: "#retention-mlkfs", shortLabel: "M-LKFS" },
+  {
+    key: "programAudioDays",
+    selector: "#retention-program-audio",
+    shortLabel: "편성 오디오",
+  },
+  {
+    key: "schedulesDays",
+    selector: "#retention-schedules",
+    shortLabel: "편성표",
+  },
+  {
+    key: "reportsDays",
+    selector: "#retention-reports",
+    shortLabel: "리포트",
+  },
+  {
+    key: "recorderLogsDays",
+    selector: "#retention-recorder-logs",
+    shortLabel: "로그",
+  },
+];
+
+function ensureRetention(channel) {
+  channel.retention ||= {};
+  for (const { key } of retentionFields) {
+    if (!Number.isFinite(Number(channel.retention[key]))) {
+      channel.retention[key] = 0;
+    }
+  }
+  return channel.retention;
+}
+
+function retentionSummary(channel) {
+  const retention = ensureRetention(channel);
+  return retentionFields
+    .map(({ key, shortLabel }) => {
+      const days = Number(retention[key]) || 0;
+      return `${shortLabel} ${days === 0 ? "무기한" : `${days}일`}`;
+    })
+    .join(" · ");
+}
+
+function renderRetentionDialog() {
+  const channel = state.settings?.channels.find(
+    (item) => item.id === $("#retention-channel").value,
+  );
+  if (!channel) return;
+  const retention = ensureRetention(channel);
+  for (const { key, selector } of retentionFields) {
+    $(selector).value = retention[key] ?? 0;
+  }
+}
+
+function openRetentionDialog(channelId = "") {
+  if (!state.settings) return;
+  const select = $("#retention-channel");
+  select.replaceChildren(
+    ...state.settings.channels.map((channel) => {
+      const option = document.createElement("option");
+      option.value = channel.id;
+      option.textContent = channel.name;
+      return option;
+    }),
+  );
+  select.value = state.settings.channels.some(
+    (channel) => channel.id === channelId,
+  )
+    ? channelId
+    : state.settings.channels[0].id;
+  state.settings.maintenance ||= { webLogsDays: 0 };
+  $("#retention-web-logs").value =
+    state.settings.maintenance.webLogsDays ?? 0;
+  renderRetentionDialog();
+  $("#retention-dialog").showModal();
+}
+
 function renderSettings() {
   if (!state.settings) return;
   $("#schedule-api").value = state.settings.scheduleApi || "";
@@ -658,11 +1232,16 @@ function renderSettings() {
     state.settings.reportSchedule?.enabled ?? true;
   $("#report-schedule-time").value =
     state.settings.reportSchedule?.timeKst || "08:00";
+  $("#retention-web-logs").value =
+    state.settings.maintenance?.webLogsDays ?? 0;
   renderSchedulerStatus();
+  renderCleanupStatus();
   const container = $("#channel-settings");
   const rows = state.settings.channels.map((channel) => {
     const row = document.createElement("div");
     row.className = "channel-setting-row";
+    const main = document.createElement("div");
+    main.className = "channel-setting-main";
 
     const nameLabel = document.createElement("label");
     nameLabel.textContent = "채널 이름";
@@ -684,6 +1263,18 @@ function renderSettings() {
       channel.recordingsDirectory = path.value;
     });
     pathLabel.append(path);
+
+    const logLabel = document.createElement("label");
+    logLabel.textContent = "레코더 로그 파일";
+    const logName = document.createElement("input");
+    logName.value = channel.recorderLogName || `recorder-${channel.id}.log`;
+    logName.placeholder = "recorder-port2.log";
+    logName.maxLength = 132;
+    logName.spellcheck = false;
+    logName.addEventListener("input", () => {
+      channel.recorderLogName = logName.value;
+    });
+    logLabel.append(logName);
 
     const reportLabel = document.createElement("label");
     reportLabel.textContent = "리포트 대상";
@@ -715,7 +1306,26 @@ function renderSettings() {
       renderSettings();
     });
 
-    row.append(nameLabel, pathLabel, reportLabel, remove);
+    main.append(nameLabel, pathLabel, logLabel, reportLabel, remove);
+
+    const policy = document.createElement("div");
+    policy.className = "channel-policy";
+    const policyText = document.createElement("div");
+    const policyTitle = document.createElement("strong");
+    policyTitle.textContent = "파일 보관";
+    const policySummary = document.createElement("small");
+    policySummary.textContent = retentionSummary(channel);
+    policyText.append(policyTitle, policySummary);
+    const policyButton = document.createElement("button");
+    policyButton.className = "button ghost";
+    policyButton.type = "button";
+    policyButton.textContent = "보관기간 설정";
+    policyButton.addEventListener("click", () =>
+      openRetentionDialog(channel.id),
+    );
+    policy.append(policyText, policyButton);
+
+    row.append(main, policy);
     return row;
   });
   container.replaceChildren(...rows);
@@ -745,6 +1355,36 @@ function renderSchedulerStatus() {
     `${labels[state.scheduler.status] || state.scheduler.status} · ${finished}`;
 }
 
+function renderCleanupStatus() {
+  const node = $("#cleanup-status");
+  const cleanup = state.scheduler?.cleanupResult;
+  if (!state.scheduler?.lastCleanupAt || !cleanup) {
+    node.textContent = "최근 자동 정리 기록이 없습니다.";
+    return;
+  }
+  const executed = new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul",
+    dateStyle: "medium",
+    timeStyle: "medium",
+  }).format(new Date(state.scheduler.lastCleanupAt));
+  const deletedBytes =
+    Number(cleanup.recordingWav?.bytes || cleanup.recordings?.bytes || 0) +
+    Number(cleanup.mlkfs?.bytes || 0) +
+    Number(cleanup.schedules?.bytes || 0) +
+    Number(cleanup.reports?.bytes || 0) +
+    Number(cleanup.operationalLogs?.bytes || 0);
+  node.textContent =
+    `최근 정리: ${executed} · ` +
+    `WAV ${cleanup.recordingWav?.files || cleanup.recordings?.files || 0}개 · ` +
+    `M-LKFS ${cleanup.mlkfs?.files || 0}개 · ` +
+    `편성 오디오 ${cleanup.programAudio?.directories || 0}일 · ` +
+    `편성표 ${cleanup.schedules?.files || 0}개 · ` +
+    `리포트 ${cleanup.reports?.files || 0}개 · ` +
+    `로그 압축 ${cleanup.operationalLogs?.rotatedFiles || 0}개 · ` +
+    `확인된 용량 ${formatBytes(deletedBytes)} · ` +
+    `오류 ${cleanup.errors?.length || 0}개`;
+}
+
 function addChannel() {
   if (!state.settings) return;
   if (state.settings.channels.length >= 16) {
@@ -755,11 +1395,19 @@ function addChannel() {
     id,
     name: `채널 ${state.settings.channels.length + 1}`,
     recordingsDirectory: "/mnt/hdd/recordings/",
+    recorderLogName: `recorder-${id}.log`,
     reportEnabled: false,
+    retention: {
+      wavDays: 0,
+      mlkfsDays: 0,
+      programAudioDays: 0,
+      schedulesDays: 0,
+      reportsDays: 0,
+      recorderLogsDays: 0,
+    },
   });
   renderSettings();
-  const inputs = $$("#channel-settings input");
-  inputs.at(-3)?.focus();
+  $("#channel-settings .channel-setting-row:last-child input")?.focus();
 }
 
 async function saveSettings() {
@@ -768,6 +1416,9 @@ async function saveSettings() {
   state.settings.reportSchedule = {
     enabled: $("#report-schedule-enabled").checked,
     timeKst: $("#report-schedule-time").value || "08:00",
+  };
+  state.settings.maintenance = {
+    webLogsDays: Number($("#retention-web-logs").value || 0),
   };
   try {
     state.settings = await api("/api/settings", {
@@ -789,11 +1440,110 @@ $$("[data-view-link]").forEach((button) =>
   button.addEventListener("click", () => switchView(button.dataset.viewLink)),
 );
 $("#refresh-view").addEventListener("click", () => switchView(state.view));
+$("#theme-toggle").addEventListener("click", () => {
+  applyTheme(
+    document.documentElement.dataset.theme === "light" ? "dark" : "light",
+  );
+});
+$("#open-retention-settings").addEventListener("click", () =>
+  openRetentionDialog(),
+);
+$("#retention-channel").addEventListener("change", renderRetentionDialog);
+for (const { key, selector } of retentionFields) {
+  $(selector).addEventListener("input", () => {
+    const channel = state.settings?.channels.find(
+      (item) => item.id === $("#retention-channel").value,
+    );
+    if (!channel) return;
+    ensureRetention(channel)[key] = Number($(selector).value || 0);
+  });
+}
+$("#retention-web-logs").addEventListener("input", () => {
+  if (!state.settings) return;
+  state.settings.maintenance ||= { webLogsDays: 0 };
+  state.settings.maintenance.webLogsDays = Number(
+    $("#retention-web-logs").value || 0,
+  );
+});
+$("#close-retention").addEventListener("click", () =>
+  $("#retention-dialog").close(),
+);
+$("#confirm-retention").addEventListener("click", () =>
+  $("#retention-dialog").close(),
+);
+$("#retention-dialog").addEventListener("close", renderSettings);
 $("#open-schedule").addEventListener("click", () => {
   $("#schedule-channel").value = $("#dashboard-channel").value;
   $("#schedule-date").value = $("#dashboard-date").value;
   switchView("schedule");
   loadSchedule();
+});
+$("#calendar-channel").addEventListener("change", () => {
+  state.calendarDate = "";
+  state.calendarData = null;
+  void loadCalendar();
+});
+$("#calendar-prev").addEventListener("click", () => {
+  state.calendarMonth = shiftMonth(
+    state.calendarMonth || todayKst().slice(0, 7),
+    -1,
+  );
+  state.calendarDate = "";
+  void loadCalendar();
+});
+$("#calendar-next").addEventListener("click", () => {
+  state.calendarMonth = shiftMonth(
+    state.calendarMonth || todayKst().slice(0, 7),
+    1,
+  );
+  state.calendarDate = "";
+  void loadCalendar();
+});
+$("#calendar-today").addEventListener("click", () => {
+  state.calendarMonth = todayKst().slice(0, 7);
+  state.calendarDate = todayKst();
+  void loadCalendar();
+});
+$("#calendar-open-schedule").addEventListener("click", () => {
+  if (!state.calendarDate || !state.calendarData) return;
+  $("#schedule-channel").value = state.calendarData.channelId;
+  $("#schedule-date").value = state.calendarDate;
+  switchView("schedule");
+  void loadSchedule();
+});
+$("#calendar-detail-open-schedule").addEventListener("click", () => {
+  $("#calendar-open-schedule").click();
+});
+$("#calendar-fetch-schedule").addEventListener("click", async () => {
+  if (!state.calendarDate || !state.calendarData) return;
+  try {
+    await api("/api/schedule/fetch", {
+      method: "POST",
+      body: JSON.stringify({
+        channelId: state.calendarData.channelId,
+        date: state.calendarDate,
+      }),
+    });
+    notify("API 편성표를 저장했습니다.");
+    await loadCalendar();
+  } catch (error) {
+    notify(error.message, true);
+  }
+});
+$("#calendar-create-report").addEventListener("click", async () => {
+  if (!state.calendarDate || !state.calendarData) return;
+  try {
+    const job = await api("/api/reports", {
+      method: "POST",
+      body: JSON.stringify({
+        channelId: state.calendarData.channelId,
+        date: state.calendarDate,
+      }),
+    });
+    showJob(job);
+  } catch (error) {
+    notify(error.message, true);
+  }
 });
 $("#load-schedule").addEventListener("click", loadSchedule);
 $("#fetch-schedule").addEventListener("click", () => fetchSchedule(true));
