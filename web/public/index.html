@@ -146,6 +146,29 @@
             </div>
           </div>
 
+          <div class="calendar-range-export panel">
+            <div class="calendar-range-copy">
+              <p class="eyebrow">RANGE ARCHIVE</p>
+              <strong>기간 자료 한 번에 받기</strong>
+              <small>
+                선택 채널의 리포트 XLSX와 시간별 M-LKFS CSV를 날짜별 폴더로
+                구성해 하나의 ZIP으로 다운로드합니다. 종료일은 마지막 편성이
+                끝나는 다음 날 새벽 구간까지 자동으로 확장됩니다.
+              </small>
+            </div>
+            <label>
+              시작일
+              <input id="calendar-archive-from" type="date" />
+            </label>
+            <label>
+              종료일
+              <input id="calendar-archive-to" type="date" />
+            </label>
+            <button id="calendar-download-archive" class="button primary" type="button">
+              리포트 + M-LKFS ZIP
+            </button>
+          </div>
+
           <div class="calendar-layout">
             <article class="panel month-calendar-panel">
               <div class="calendar-weekdays" aria-hidden="true">
@@ -364,6 +387,37 @@
       <pre id="job-log"></pre>
       <div class="dialog-actions">
         <button id="download-job-report" class="button primary" hidden>리포트 다운로드</button>
+      </div>
+    </dialog>
+
+    <dialog id="audio-preview-dialog" class="audio-preview-dialog">
+      <div class="dialog-head">
+        <div>
+          <p class="eyebrow">PROGRAMME AUDIO</p>
+          <h2 id="audio-preview-title">편성 오디오</h2>
+          <small id="audio-preview-meta" class="audio-preview-meta"></small>
+        </div>
+        <button id="close-audio-preview" class="icon-button" type="button">×</button>
+      </div>
+      <div class="audio-preview-body">
+        <audio id="audio-preview-player" controls preload="metadata"></audio>
+        <div class="audio-preview-tools">
+          <button id="audio-back-10" class="button secondary" type="button">−10초</button>
+          <button id="audio-forward-10" class="button secondary" type="button">+10초</button>
+          <label>
+            재생속도
+            <select id="audio-playback-rate">
+              <option value="0.5">0.5×</option>
+              <option value="0.75">0.75×</option>
+              <option value="1" selected>1.0×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.5×</option>
+              <option value="2">2.0×</option>
+            </select>
+          </label>
+          <a id="audio-preview-download" class="button ghost">WAV 다운로드</a>
+        </div>
+        <small id="audio-preview-file" class="audio-preview-file"></small>
       </div>
     </dialog>
 

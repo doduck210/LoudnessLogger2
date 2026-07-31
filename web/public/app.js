@@ -20,8 +20,6 @@ const state = {
   calendarTimer: null,
   calendarContentKey: "",
   calendarContentRequest: 0,
-  previewAudio: null,
-  previewAudioButton: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -146,6 +144,7 @@ function switchView(view) {
   $("#page-title").textContent = titles[view];
   if (view === "dashboard") loadDashboard();
   if (view === "calendar") {
+    updateArchiveDateLimits();
     loadCalendar();
     state.calendarTimer = setInterval(loadCalendar, 5_000);
   }
@@ -213,6 +212,23 @@ function shiftMonth(month, amount) {
   const value = new Date(`${month}-01T00:00:00Z`);
   value.setUTCMonth(value.getUTCMonth() + amount);
   return value.toISOString().slice(0, 7);
+}
+
+function shiftDate(date, amount) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + amount);
+  return value.toISOString().slice(0, 10);
+}
+
+function updateArchiveDateLimits() {
+  const latestDate = yesterdayKst();
+  const from = $("#calendar-archive-from");
+  const to = $("#calendar-archive-to");
+  from.max = latestDate;
+  to.max = latestDate;
+  if (!to.value || to.value > latestDate) to.value = latestDate;
+  if (!from.value) from.value = shiftDate(latestDate, -89);
+  if (from.value > latestDate) from.value = latestDate;
 }
 
 async function loadCalendar() {
@@ -453,6 +469,32 @@ function renderCalendarDetail(day) {
     });
 }
 
+function openAudioPreview({
+  url,
+  fileName,
+  title,
+  date,
+  startTime,
+  duration,
+  partLabel,
+}) {
+  const player = $("#audio-preview-player");
+  player.pause();
+  player.src = url;
+  player.load();
+  $("#audio-preview-title").textContent = title || "편성 오디오";
+  $("#audio-preview-meta").textContent =
+    `${date} ${startTime} · ${formatDuration(duration)}` +
+    (partLabel ? ` · 파일 ${partLabel}` : "");
+  $("#audio-preview-file").textContent = fileName;
+  const download = $("#audio-preview-download");
+  download.href = url;
+  download.download = fileName;
+  $("#audio-playback-rate").value = "1";
+  player.playbackRate = 1;
+  $("#audio-preview-dialog").showModal();
+}
+
 function renderCalendarSchedulePreview(
   schedule,
   report,
@@ -461,11 +503,6 @@ function renderCalendarSchedulePreview(
   date,
 ) {
   const container = $("#calendar-schedule-preview");
-  if (state.previewAudio) {
-    state.previewAudio.pause();
-    state.previewAudio = null;
-    state.previewAudioButton = null;
-  }
   const reportRows = new Map(
     (report?.rows || []).map((row) => [
       `${row.startTime}|${row.programId || ""}`,
@@ -538,48 +575,31 @@ function renderCalendarSchedulePreview(
         `/api/program-audio/file?channelId=${encodeURIComponent(channelId)}` +
         `&date=${encodeURIComponent(date)}` +
         `&name=${encodeURIComponent(file.name)}`;
-      const play = document.createElement("button");
-      play.className = "calendar-audio-play";
-      play.dataset.idleLabel =
-        files.length > 1 ? `▶${partIndex + 1}` : "▶";
-      play.textContent = play.dataset.idleLabel;
-      play.title =
-        files.length > 1
-          ? `오디오 ${partIndex + 1}/${files.length} 재생`
-          : "편성 오디오 재생";
-      play.addEventListener("click", () => {
-        if (state.previewAudioButton === play && state.previewAudio) {
-          if (state.previewAudio.paused) {
-            void state.previewAudio.play();
-            play.textContent = "Ⅱ";
-          } else {
-            state.previewAudio.pause();
-            play.textContent = play.dataset.idleLabel;
-          }
-          return;
-        }
-        if (state.previewAudio) state.previewAudio.pause();
-        if (state.previewAudioButton) {
-          state.previewAudioButton.textContent =
-            state.previewAudioButton.dataset.idleLabel || "▶";
-        }
-        const player = new Audio(url);
-        state.previewAudio = player;
-        state.previewAudioButton = play;
-        play.textContent = "Ⅱ";
-        player.addEventListener("ended", () => {
-          play.textContent = play.dataset.idleLabel;
-          if (state.previewAudio === player) {
-            state.previewAudio = null;
-            state.previewAudioButton = null;
-          }
-        });
-        player.addEventListener("error", () => {
-          play.textContent = play.dataset.idleLabel;
-          notify("편성 오디오를 재생할 수 없습니다.", true);
-        });
-        void player.play().catch(() => {
-          play.textContent = play.dataset.idleLabel;
+      const control = document.createElement("div");
+      control.className = "calendar-audio-control";
+      if (files.length > 1) {
+        control.classList.add("multipart");
+        const part = document.createElement("span");
+        part.textContent = `${partIndex + 1}/${files.length}`;
+        control.append(part);
+      }
+      const listen = document.createElement("button");
+      listen.className = "calendar-audio-open";
+      listen.type = "button";
+      listen.textContent = files.length > 1
+        ? `듣기 ${partIndex + 1}`
+        : "듣기";
+      listen.title = `${item.ProgramItemName || "편성 오디오"} 크게 열기`;
+      listen.addEventListener("click", () => {
+        openAudioPreview({
+          url,
+          fileName: file.name,
+          title: item.ProgramItemName,
+          date,
+          startTime,
+          duration: item.Duration,
+          partLabel:
+            files.length > 1 ? `${partIndex + 1}/${files.length}` : "",
         });
       });
       const download = document.createElement("a");
@@ -588,7 +608,8 @@ function renderCalendarSchedulePreview(
       download.title = "WAV 다운로드";
       download.href = url;
       download.download = file.name;
-      audioCell.append(play, download);
+      control.append(listen, download);
+      audioCell.append(control);
     });
     if (!files.length) audioCell.textContent = "—";
     row.append(audioCell);
@@ -1504,6 +1525,36 @@ $("#calendar-today").addEventListener("click", () => {
   state.calendarDate = todayKst();
   void loadCalendar();
 });
+$("#calendar-download-archive").addEventListener("click", () => {
+  const channelId = $("#calendar-channel").value;
+  const from = $("#calendar-archive-from").value;
+  const to = $("#calendar-archive-to").value;
+  if (!channelId || !from || !to) {
+    return notify("채널과 다운로드 기간을 모두 선택하세요.", true);
+  }
+  const fromTime = Date.parse(`${from}T00:00:00Z`);
+  const toTime = Date.parse(`${to}T00:00:00Z`);
+  const days = Math.floor((toTime - fromTime) / 86_400_000) + 1;
+  if (!Number.isFinite(days) || days < 1) {
+    return notify("종료일은 시작일보다 빠를 수 없습니다.", true);
+  }
+  if (days > 366) {
+    return notify("한 번에 최대 366일까지 다운로드할 수 있습니다.", true);
+  }
+  if (to > yesterdayKst()) {
+    return notify("종료일은 서울 기준 전일까지만 선택할 수 있습니다.", true);
+  }
+  const link = document.createElement("a");
+  link.href =
+    `/api/archive/download?channelId=${encodeURIComponent(channelId)}` +
+    `&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  notify(
+    `${days}일치 ZIP을 준비하고 있습니다. 파일이 크면 다운로드 시작까지 시간이 걸릴 수 있습니다.`,
+  );
+});
 $("#calendar-open-schedule").addEventListener("click", () => {
   if (!state.calendarDate || !state.calendarData) return;
   $("#schedule-channel").value = state.calendarData.channelId;
@@ -1555,6 +1606,30 @@ $("#schedule-filter").addEventListener("input", (event) => {
   state.filter = event.target.value;
   renderSchedule();
 });
+$("#audio-back-10").addEventListener("click", () => {
+  const player = $("#audio-preview-player");
+  player.currentTime = Math.max(0, player.currentTime - 10);
+});
+$("#audio-forward-10").addEventListener("click", () => {
+  const player = $("#audio-preview-player");
+  const target = player.currentTime + 10;
+  player.currentTime = Number.isFinite(player.duration)
+    ? Math.min(player.duration, target)
+    : target;
+});
+$("#audio-playback-rate").addEventListener("change", () => {
+  $("#audio-preview-player").playbackRate =
+    Number($("#audio-playback-rate").value) || 1;
+});
+$("#close-audio-preview").addEventListener("click", () =>
+  $("#audio-preview-dialog").close(),
+);
+$("#audio-preview-dialog").addEventListener("close", () => {
+  const player = $("#audio-preview-player");
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+});
 $("#close-job").addEventListener("click", () => $("#job-dialog").close());
 $("#add-channel").addEventListener("click", addChannel);
 $("#save-settings").addEventListener("click", saveSettings);
@@ -1572,5 +1647,8 @@ $("#schedule-channel").addEventListener("change", () => {
 const defaultDate = yesterdayKst();
 $("#dashboard-date").value = defaultDate;
 $("#schedule-date").value = defaultDate;
+$("#calendar-archive-to").value = defaultDate;
+$("#calendar-archive-from").value = shiftDate(defaultDate, -89);
+updateArchiveDateLimits();
 loadDashboard();
 setInterval(loadDashboard, 15_000);

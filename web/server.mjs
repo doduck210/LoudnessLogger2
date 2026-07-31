@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { createGzip, inflateRawSync } from "node:zlib";
+import { createDeflateRaw, createGzip, inflateRawSync } from "node:zlib";
 
 const webDirectory = dirname(fileURLToPath(import.meta.url));
 const projectDirectory = resolve(webDirectory, "..");
@@ -123,6 +123,7 @@ await Promise.all([
 let runtimeSettings = await loadRuntimeSettings();
 let schedulerState = await loadSchedulerState();
 let schedulerBusy = false;
+let archiveDownloadBusy = false;
 
 function parsePort(value) {
   const port = Number(value);
@@ -541,6 +542,37 @@ function requireMonth(value) {
   return value;
 }
 
+function requireDateRange(fromValue, toValue, maximumDays = 366) {
+  const from = requireDate(fromValue);
+  const to = requireDate(toValue);
+  const latestDate = previousDate(kstNowParts().date);
+  if (to > latestDate) {
+    throw httpError(
+      400,
+      `종료일은 서울 기준 전일(${latestDate})까지만 선택할 수 있습니다.`,
+    );
+  }
+  const fromTime = Date.parse(`${from}T00:00:00Z`);
+  const toTime = Date.parse(`${to}T00:00:00Z`);
+  if (toTime < fromTime) {
+    throw httpError(400, "종료일은 시작일보다 빠를 수 없습니다.");
+  }
+  const dayCount = Math.floor((toTime - fromTime) / 86_400_000) + 1;
+  if (dayCount > maximumDays) {
+    throw httpError(
+      400,
+      `한 번에 다운로드할 수 있는 기간은 최대 ${maximumDays}일입니다.`,
+    );
+  }
+  const dates = [];
+  for (let offset = 0; offset < dayCount; ++offset) {
+    dates.push(
+      new Date(fromTime + offset * 86_400_000).toISOString().slice(0, 10),
+    );
+  }
+  return { from, to, dates };
+}
+
 async function directoryNames(directory) {
   try {
     return await readdir(directory);
@@ -548,6 +580,161 @@ async function directoryNames(directory) {
     if (error?.code === "ENOENT") return [];
     throw error;
   }
+}
+
+async function rangeArchiveEntries(channel, range) {
+  const allowedDates = new Set(range.dates);
+  const requestedStart = Date.parse(`${range.from}T00:00:00+09:00`);
+  const requestedEnd =
+    Date.parse(`${range.to}T00:00:00+09:00`) + 86_400_000;
+  let mlkfsCoverageEnd = requestedEnd;
+  let lastProgramEnd = null;
+  let scheduleLoaded = false;
+  let scheduleWarning = null;
+  try {
+    const schedule = await readSchedule(channel, range.to);
+    scheduleLoaded = true;
+    for (const item of schedule.items) {
+      const start = Date.parse(
+        `${item.StartTime.replace(" ", "T")}+09:00`,
+      );
+      const end = start + Number(item.Duration) * 1_000;
+      if (Number.isFinite(end) && (lastProgramEnd === null || end > lastProgramEnd)) {
+        lastProgramEnd = end;
+      }
+    }
+    if (lastProgramEnd !== null) {
+      mlkfsCoverageEnd = Math.max(mlkfsCoverageEnd, lastProgramEnd);
+    }
+  } catch (error) {
+    scheduleWarning =
+      `종료일 ${range.to} 편성표를 읽지 못해 M-LKFS를 자정까지만 포함했습니다: ` +
+      error.message;
+  }
+  const [recordingEntries, reportEntries] = await Promise.all([
+    readdir(channel.recordingsDirectory, { withFileTypes: true }),
+    readdir(config.reportsDirectory, { withFileTypes: true }),
+  ]);
+  const rootName =
+    `Loudness_Archive_${channelFileName(channel)}_${range.from}_${range.to}`;
+  const files = [];
+  const counts = new Map(
+    range.dates.map((date) => [date, { reports: 0, mlkfs: 0 }]),
+  );
+  const extensionDate = new Date(`${range.to}T00:00:00Z`);
+  for (let offset = 1; offset <= 7; ++offset) {
+    extensionDate.setUTCDate(extensionDate.getUTCDate() + 1);
+    const date = extensionDate.toISOString().slice(0, 10);
+    const dateStart = Date.parse(`${date}T00:00:00+09:00`);
+    if (dateStart >= mlkfsCoverageEnd) break;
+    counts.set(date, { reports: 0, mlkfs: 0 });
+  }
+  const mlkfsPattern =
+    /^(\d{4}-\d{2}-\d{2})_(\d{2})\.(\d{2})\.(\d{2})_mlkfs(?:_part\d+)?\.csv$/;
+  for (const entry of recordingEntries) {
+    if (!entry.isFile()) continue;
+    const match = mlkfsPattern.exec(entry.name);
+    if (!match) continue;
+    const date = match[1];
+    const fileStart = Date.parse(
+      `${date}T${match[2]}:${match[3]}:${match[4]}+09:00`,
+    );
+    if (
+      !Number.isFinite(fileStart) ||
+      fileStart < requestedStart ||
+      fileStart >= mlkfsCoverageEnd
+    ) {
+      continue;
+    }
+    if (!counts.has(date)) {
+      counts.set(date, { reports: 0, mlkfs: 0 });
+    }
+    files.push({
+      sourcePath: join(channel.recordingsDirectory, entry.name),
+      archivePath: `${rootName}/mlkfs/${date}/${entry.name}`,
+    });
+    counts.get(date).mlkfs += 1;
+  }
+  const reportPrefixes = [channelFileName(channel), channel.id]
+    .map(escapeRegExp)
+    .join("|");
+  const reportPattern = new RegExp(
+    `^(?:${reportPrefixes})_Loudness_Report_` +
+      `(\\d{4}-\\d{2}-\\d{2})\\.xlsx$`,
+  );
+  for (const entry of reportEntries) {
+    if (!entry.isFile()) continue;
+    const date = reportPattern.exec(entry.name)?.[1];
+    if (!date || !allowedDates.has(date)) continue;
+    files.push({
+      sourcePath: join(config.reportsDirectory, entry.name),
+      archivePath: `${rootName}/reports/${entry.name}`,
+    });
+    counts.get(date).reports += 1;
+  }
+  files.sort((left, right) =>
+    left.archivePath.localeCompare(right.archivePath, "en"),
+  );
+  const dateStatus = [...counts]
+    .sort(([left], [right]) => left.localeCompare(right, "en"))
+    .map(([date, count]) => ({
+      date,
+      reportFiles: count.reports,
+      mlkfsFiles: count.mlkfs,
+      extendedForLastSchedule: date > range.to,
+    }));
+  const formatKst = (time) =>
+    time === null
+      ? null
+      : new Intl.DateTimeFormat("sv-SE", {
+          timeZone: "Asia/Seoul",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hourCycle: "h23",
+        }).format(new Date(time));
+  const manifest = {
+    formatVersion: 1,
+    generatedAt: new Date().toISOString(),
+    timeZone: "Asia/Seoul",
+    channel: { id: channel.id, name: channel.name },
+    range: {
+      from: range.from,
+      to: range.to,
+      days: range.dates.length,
+    },
+    mlkfsCoverage: {
+      requestedEndKst: formatKst(requestedEnd),
+      lastDayScheduleLoaded: scheduleLoaded,
+      lastProgramEndKst: formatKst(lastProgramEnd),
+      includedUntilKst: formatKst(mlkfsCoverageEnd),
+      extendedBeyondMidnight: mlkfsCoverageEnd > requestedEnd,
+      warning: scheduleWarning,
+    },
+    totals: {
+      reportFiles: dateStatus.reduce(
+        (sum, date) => sum + date.reportFiles,
+        0,
+      ),
+      mlkfsFiles: dateStatus.reduce(
+        (sum, date) => sum + date.mlkfsFiles,
+        0,
+      ),
+    },
+    dates: dateStatus,
+  };
+  files.unshift({
+    data: Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8"),
+    archivePath: `${rootName}/manifest.json`,
+  });
+  return {
+    fileName: `${rootName}.zip`,
+    files,
+    manifest,
+  };
 }
 
 async function calendarMonth(channel, month) {
@@ -1507,6 +1694,11 @@ function sendJson(response, status, value) {
 }
 
 function sendError(response, error) {
+  if (response.headersSent) {
+    console.error(error);
+    response.destroy(error);
+    return;
+  }
   const status = Number.isInteger(error?.status) ? error.status : 500;
   if (status >= 500) console.error(error);
   sendJson(response, status, {
@@ -1567,6 +1759,239 @@ async function sendAudioFile(request, response, path) {
   createReadStream(path, { start, end }).pipe(response);
 }
 
+const zipCrcTable = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; ++bit) {
+    value = (value & 1) !== 0
+      ? 0xedb88320 ^ (value >>> 1)
+      : value >>> 1;
+  }
+  return value >>> 0;
+});
+
+function updateZipCrc(crc, chunk) {
+  let value = crc;
+  for (const byte of chunk) {
+    value = zipCrcTable[(value ^ byte) & 0xff] ^ (value >>> 8);
+  }
+  return value >>> 0;
+}
+
+function zipDosTime(date) {
+  const year = Math.min(2107, Math.max(1980, date.getUTCFullYear()));
+  return {
+    time:
+      (date.getUTCHours() << 11) |
+      (date.getUTCMinutes() << 5) |
+      Math.floor(date.getUTCSeconds() / 2),
+    date:
+      ((year - 1980) << 9) |
+      ((date.getUTCMonth() + 1) << 5) |
+      date.getUTCDate(),
+  };
+}
+
+async function writeResponseChunk(response, chunk) {
+  if (response.destroyed) {
+    throw new Error("다운로드 연결이 종료되었습니다.");
+  }
+  if (response.write(chunk)) return;
+  await new Promise((resolveWait, rejectWait) => {
+    const cleanup = () => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      response.off("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolveWait();
+    };
+    const onClose = () => {
+      cleanup();
+      rejectWait(new Error("다운로드 연결이 종료되었습니다."));
+    };
+    const onError = (error) => {
+      cleanup();
+      rejectWait(error);
+    };
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+    response.once("error", onError);
+  });
+}
+
+async function writeZipEntry(response, entry, offset) {
+  const name = Buffer.from(entry.archivePath, "utf8");
+  if (name.length > 65_535) {
+    throw new Error("압축 파일 내부 경로가 너무 깁니다.");
+  }
+  const info = entry.data
+    ? { size: entry.data.length, mtime: new Date() }
+    : await stat(entry.sourcePath);
+  if (info.size > 0xffff_ffff) {
+    throw new Error(
+      `단일 파일이 ZIP 제한을 초과했습니다: ${entry.archivePath}`,
+    );
+  }
+  const dos = zipDosTime(info.mtime);
+  const localHeader = Buffer.alloc(30 + name.length);
+  localHeader.writeUInt32LE(0x04034b50, 0);
+  localHeader.writeUInt16LE(20, 4);
+  localHeader.writeUInt16LE(0x0808, 6);
+  localHeader.writeUInt16LE(8, 8);
+  localHeader.writeUInt16LE(dos.time, 10);
+  localHeader.writeUInt16LE(dos.date, 12);
+  localHeader.writeUInt16LE(name.length, 26);
+  name.copy(localHeader, 30);
+  await writeResponseChunk(response, localHeader);
+
+  let crc = 0xffff_ffff;
+  let uncompressedSize = 0;
+  let compressedSize = 0;
+  const deflater = createDeflateRaw({ level: 6 });
+  let source = null;
+  if (entry.data) {
+    crc = updateZipCrc(crc, entry.data);
+    uncompressedSize = entry.data.length;
+    deflater.end(entry.data);
+  } else {
+    source = createReadStream(entry.sourcePath);
+    source.on("data", (chunk) => {
+      crc = updateZipCrc(crc, chunk);
+      uncompressedSize += chunk.length;
+    });
+    source.on("error", (error) => deflater.destroy(error));
+    source.pipe(deflater);
+  }
+  try {
+    for await (const chunk of deflater) {
+      compressedSize += chunk.length;
+      await writeResponseChunk(response, chunk);
+    }
+  } finally {
+    source?.destroy();
+    deflater.destroy();
+  }
+  if (
+    compressedSize > 0xffff_ffff ||
+    uncompressedSize > 0xffff_ffff
+  ) {
+    throw new Error(
+      `단일 파일이 ZIP 제한을 초과했습니다: ${entry.archivePath}`,
+    );
+  }
+  crc = (crc ^ 0xffff_ffff) >>> 0;
+  const descriptor = Buffer.alloc(16);
+  descriptor.writeUInt32LE(0x08074b50, 0);
+  descriptor.writeUInt32LE(crc, 4);
+  descriptor.writeUInt32LE(compressedSize, 8);
+  descriptor.writeUInt32LE(uncompressedSize, 12);
+  await writeResponseChunk(response, descriptor);
+
+  return {
+    name,
+    crc,
+    compressedSize,
+    uncompressedSize,
+    localOffset: offset,
+    dos,
+    bytesWritten:
+      BigInt(localHeader.length) +
+      BigInt(compressedSize) +
+      BigInt(descriptor.length),
+  };
+}
+
+function zipCentralHeader(entry) {
+  const needsZip64Offset = entry.localOffset > 0xffff_ffffn;
+  const extra = needsZip64Offset ? Buffer.alloc(12) : Buffer.alloc(0);
+  if (needsZip64Offset) {
+    extra.writeUInt16LE(0x0001, 0);
+    extra.writeUInt16LE(8, 2);
+    extra.writeBigUInt64LE(entry.localOffset, 4);
+  }
+  const header = Buffer.alloc(46 + entry.name.length + extra.length);
+  header.writeUInt32LE(0x02014b50, 0);
+  header.writeUInt16LE(45, 4);
+  header.writeUInt16LE(needsZip64Offset ? 45 : 20, 6);
+  header.writeUInt16LE(0x0808, 8);
+  header.writeUInt16LE(8, 10);
+  header.writeUInt16LE(entry.dos.time, 12);
+  header.writeUInt16LE(entry.dos.date, 14);
+  header.writeUInt32LE(entry.crc, 16);
+  header.writeUInt32LE(entry.compressedSize, 20);
+  header.writeUInt32LE(entry.uncompressedSize, 24);
+  header.writeUInt16LE(entry.name.length, 28);
+  header.writeUInt16LE(extra.length, 30);
+  header.writeUInt32LE(
+    needsZip64Offset ? 0xffff_ffff : Number(entry.localOffset),
+    42,
+  );
+  entry.name.copy(header, 46);
+  extra.copy(header, 46 + entry.name.length);
+  return header;
+}
+
+async function sendRangeArchive(request, response, archive) {
+  response.writeHead(200, {
+    "Content-Type": "application/zip",
+    "Content-Disposition":
+      `attachment; filename*=UTF-8''${encodeURIComponent(archive.fileName)}`,
+    "Cache-Control": "private, no-store",
+    "X-Archive-Report-Files": archive.manifest.totals.reportFiles,
+    "X-Archive-MLKFS-Files": archive.manifest.totals.mlkfsFiles,
+  });
+  let offset = 0n;
+  const centralEntries = [];
+  for (const file of archive.files) {
+    if (request.destroyed || response.destroyed) {
+      throw new Error("다운로드 연결이 종료되었습니다.");
+    }
+    const centralEntry = await writeZipEntry(response, file, offset);
+    centralEntries.push(centralEntry);
+    offset += centralEntry.bytesWritten;
+  }
+  const centralOffset = offset;
+  for (const entry of centralEntries) {
+    const header = zipCentralHeader(entry);
+    await writeResponseChunk(response, header);
+    offset += BigInt(header.length);
+  }
+  const centralSize = offset - centralOffset;
+  const zip64Offset = offset;
+  const zip64 = Buffer.alloc(56);
+  zip64.writeUInt32LE(0x06064b50, 0);
+  zip64.writeBigUInt64LE(44n, 4);
+  zip64.writeUInt16LE(45, 12);
+  zip64.writeUInt16LE(45, 14);
+  zip64.writeBigUInt64LE(BigInt(centralEntries.length), 24);
+  zip64.writeBigUInt64LE(BigInt(centralEntries.length), 32);
+  zip64.writeBigUInt64LE(centralSize, 40);
+  zip64.writeBigUInt64LE(centralOffset, 48);
+  await writeResponseChunk(response, zip64);
+
+  const locator = Buffer.alloc(20);
+  locator.writeUInt32LE(0x07064b50, 0);
+  locator.writeBigUInt64LE(zip64Offset, 8);
+  locator.writeUInt32LE(1, 16);
+  await writeResponseChunk(response, locator);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  const classicEntries = Math.min(centralEntries.length, 0xffff);
+  eocd.writeUInt16LE(classicEntries, 8);
+  eocd.writeUInt16LE(classicEntries, 10);
+  eocd.writeUInt32LE(
+    centralSize > 0xffff_ffffn ? 0xffff_ffff : Number(centralSize),
+    12,
+  );
+  eocd.writeUInt32LE(
+    centralOffset > 0xffff_ffffn ? 0xffff_ffff : Number(centralOffset),
+    16,
+  );
+  response.end(eocd);
+}
+
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -1603,6 +2028,32 @@ async function route(request, response) {
     const channel = requireChannel(url.searchParams.get("channelId"), true);
     const month = requireMonth(url.searchParams.get("month"));
     return sendJson(response, 200, await calendarMonth(channel, month));
+  }
+  if (
+    request.method === "GET" &&
+    pathname === "/api/archive/download"
+  ) {
+    if (archiveDownloadBusy) {
+      throw httpError(
+        409,
+        "다른 기간 압축 다운로드가 진행 중입니다. 완료 후 다시 시도하세요.",
+      );
+    }
+    const channel = requireChannel(url.searchParams.get("channelId"), true);
+    const range = requireDateRange(
+      url.searchParams.get("from"),
+      url.searchParams.get("to"),
+    );
+    archiveDownloadBusy = true;
+    try {
+      return await sendRangeArchive(
+        request,
+        response,
+        await rangeArchiveEntries(channel, range),
+      );
+    } finally {
+      archiveDownloadBusy = false;
+    }
   }
   if (request.method === "POST" && pathname === "/api/schedule/fetch") {
     const body = await readJsonBody(request);
