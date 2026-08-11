@@ -4,16 +4,19 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <getopt.h>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <time.h>
 
 namespace {
 
@@ -107,7 +110,7 @@ void printUsage(const char* program) {
         << "  -m, --mode INDEX            Fixed display-mode index (default: auto detect)\n"
         << "  -o, --output DIRECTORY      WAV output directory (default: "
         << config::kRecordingsDirectory.string() << ")\n"
-        << "  -s, --segment-minutes N     Local-clock aligned segment length (default: 60)\n"
+        << "  -s, --segment-minutes N     Server-clock aligned segment length (default: 60)\n"
         << "  -q, --queue-mib N           Writer queue capacity (default: 64 MiB)\n"
         << "      --lkfs-filter NAME      Loudness filter: rbj or deman (default: rbj)\n"
         << "      --list-devices          List capture-capable DeckLink devices\n"
@@ -355,12 +358,61 @@ public:
         BMDTimeValue packetTime = 0;
         const bool packetTimeValid =
             audioPacket->GetPacketTime(&packetTime, 48000) == S_OK;
+        auto systemNow = std::chrono::system_clock::now();
+        auto packetCompletedAt = systemNow;
+        if (packetTimeValid && videoFrame) {
+            constexpr BMDTimeScale kNanosecondsPerSecond = 1000000000LL;
+            BMDTimeValue referenceFrameTime = 0;
+            BMDTimeValue referenceFrameDuration = 0;
+            BMDTimeValue videoStreamTime = 0;
+            BMDTimeValue videoStreamDuration = 0;
+            if (videoFrame->GetHardwareReferenceTimestamp(
+                    kNanosecondsPerSecond, &referenceFrameTime,
+                    &referenceFrameDuration) == S_OK &&
+                videoFrame->GetStreamTime(&videoStreamTime,
+                                          &videoStreamDuration, 48000) == S_OK) {
+                timespec rawTime{};
+                if (clock_gettime(CLOCK_MONOTONIC_RAW, &rawTime) == 0) {
+                    systemNow = std::chrono::system_clock::now();
+                    const std::int64_t rawNanoseconds =
+                        static_cast<std::int64_t>(rawTime.tv_sec) *
+                            kNanosecondsPerSecond + rawTime.tv_nsec;
+                    const std::int64_t systemNanoseconds =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            systemNow.time_since_epoch()).count();
+                    const std::int64_t packetStartReference =
+                        referenceFrameTime - referenceFrameDuration +
+                        static_cast<std::int64_t>(std::llround(
+                            static_cast<long double>(packetTime -
+                                                     videoStreamTime) *
+                            kNanosecondsPerSecond / 48000.0L));
+                    const std::int64_t packetDuration =
+                        static_cast<std::int64_t>(std::llround(
+                            static_cast<long double>(frameCount) *
+                            kNanosecondsPerSecond / 48000.0L));
+                    const std::int64_t packetEndSystem =
+                        systemNanoseconds - rawNanoseconds +
+                        packetStartReference + packetDuration;
+                    // Reject an incompatible driver reference-clock epoch and
+                    // fall back to callback arrival time if necessary.
+                    if (std::llabs(packetEndSystem - systemNanoseconds) <
+                        kNanosecondsPerSecond) {
+                        packetCompletedAt =
+                            std::chrono::system_clock::time_point{
+                                std::chrono::nanoseconds{packetEndSystem}};
+                        hardwareTimestamps_.fetch_add(1);
+                    }
+                }
+            }
+        }
+        const std::int64_t arrivalNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
         writer_.enqueue(bytes, static_cast<std::uint32_t>(frameCount),
                         packetTime, packetTimeValid,
-                        std::chrono::system_clock::now());
+                        packetCompletedAt);
         audioPackets_.fetch_add(1);
-        lastAudioPacketNs_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
+        lastAudioPacketNs_.store(arrivalNs);
         return S_OK;
     }
 
@@ -399,8 +451,10 @@ public:
     bool formatChangeFailed() const { return formatChangeFailed_.load(); }
     std::uint64_t audioPackets() const { return audioPackets_.load(); }
     std::uint64_t packetErrors() const { return packetErrors_.load(); }
+    std::uint64_t hardwareTimestamps() const {
+        return hardwareTimestamps_.load();
+    }
     std::int64_t lastAudioPacketNs() const { return lastAudioPacketNs_.load(); }
-
 private:
     std::atomic<ULONG> referenceCount_{1};
     IDeckLinkInput* input_;
@@ -412,6 +466,7 @@ private:
     std::atomic<std::uint64_t> validVideoFrames_{0};
     std::atomic<std::uint64_t> audioPackets_{0};
     std::atomic<std::uint64_t> packetErrors_{0};
+    std::atomic<std::uint64_t> hardwareTimestamps_{0};
     std::atomic<std::int64_t> lastAudioPacketNs_{0};
 };
 
@@ -471,14 +526,18 @@ int run(const Options& options) {
     bool streamsStarted = false;
     std::uint64_t finalAudioPackets = 0;
     std::uint64_t finalPacketErrors = 0;
+    std::uint64_t finalHardwareTimestamps = 0;
+    WavSegmentWriter::Stats queueStatsBeforeDrain;
 
     auto cleanup = [&]() {
         if (streamsStarted) input->StopStreams();
+        queueStatsBeforeDrain = writer.stats();
         if (audioEnabled) input->DisableAudioInput();
         if (videoEnabled) input->DisableVideoInput();
         if (callbackRegistered) input->SetCallback(nullptr);
         finalAudioPackets = callback->audioPackets();
         finalPacketErrors = callback->packetErrors();
+        finalHardwareTimestamps = callback->hardwareTimestamps();
         callback->Release();
         writer.stop();
     };
@@ -576,9 +635,22 @@ int run(const Options& options) {
     const auto finalStats = writer.stats();
     std::cout << "Stopped. audio_packets=" << finalAudioPackets
               << " packet_errors=" << finalPacketErrors
+              << " hardware_timestamps=" << finalHardwareTimestamps
               << " written_frames=" << finalStats.writtenSampleFrames
               << " dropped_frames=" << finalStats.droppedSampleFrames
               << " inserted_silence_frames=" << finalStats.insertedSilentFrames
+              << '\n';
+    constexpr double bytesPerSecond =
+        48000.0 * kAudioChannels * (kAudioBitsPerSample / 8U);
+    std::cout << std::fixed << std::setprecision(6)
+              << "Server clock: locked="
+              << (finalStats.serverClockLocked ? "yes" : "no")
+              << " estimated_sample_rate_hz="
+              << finalStats.estimatedSampleRate
+              << " queue_seconds_at_stop="
+              << queueStatsBeforeDrain.currentQueuedBytes / bytesPerSecond
+              << " maximum_queue_seconds="
+              << finalStats.maximumQueuedBytes / bytesPerSecond
               << '\n';
     return result;
 }

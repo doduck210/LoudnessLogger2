@@ -1513,7 +1513,7 @@ async function runScheduledCleanup(runDateKst) {
       days,
       runDate: runDateKst,
       pattern:
-        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}(?:_part\d+)?\.wav$/,
+        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}(?:_part\d+)?(?:\.wav|\.timing\.csv)$/,
       category: "recordingWav",
       result,
       protectedDates,

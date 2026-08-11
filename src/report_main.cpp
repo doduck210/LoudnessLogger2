@@ -61,8 +61,8 @@ struct Program {
 };
 
 struct Momentary {
-    std::int64_t startTenths = 0;
-    std::int64_t endTenths = 0;
+    std::int64_t startNanoseconds = 0;
+    std::int64_t endNanoseconds = 0;
     double value = -std::numeric_limits<double>::infinity();
     std::string filter;
 };
@@ -568,7 +568,7 @@ std::int64_t parseKstSecond(const std::string& text) {
     return static_cast<std::int64_t>(localAsUtc) - kSeoulUtcOffsetSeconds;
 }
 
-std::int64_t parseCsvTenths(const std::string& text) {
+std::int64_t parseCsvNanoseconds(const std::string& text) {
     if (text.size() < 19) {
         throw std::runtime_error("Invalid CSV timestamp: " + text);
     }
@@ -587,12 +587,7 @@ std::int64_t parseCsvTenths(const std::string& text) {
         }
         while (digits++ < 9) nanoseconds *= 10;
     }
-    std::int64_t tenths = (nanoseconds + 50000000LL) / 100000000LL;
-    if (tenths == 10) {
-        ++seconds;
-        tenths = 0;
-    }
-    return seconds * 10 + tenths;
+    return seconds * 1000000000LL + nanoseconds;
 }
 
 std::vector<Program> parseSchedule(const std::string& jsonText) {
@@ -694,8 +689,6 @@ std::vector<Momentary> loadMomentaries(
                       valueIndex, filterIndex}) + 1;
 
         std::size_t lineNumber = 1;
-        std::optional<std::int64_t> anchorTenths;
-        std::uint64_t anchorSample = 0;
         while (std::getline(input, line)) {
             ++lineNumber;
             if (line.empty()) continue;
@@ -709,26 +702,21 @@ std::vector<Momentary> loadMomentaries(
                 std::stoull(fields[startSampleIndex]);
             const std::uint64_t endSample =
                 std::stoull(fields[endSampleIndex]);
-            if (!anchorTenths) {
-                anchorTenths = parseCsvTenths(fields[startIndex]);
-                anchorSample = startSample;
-            }
-            if (startSample < anchorSample ||
-                (startSample - anchorSample) %
-                        loudness::LKFS::kHopSamples != 0 ||
-                endSample - startSample != loudness::LKFS::kWindowSamples) {
+            if (endSample - startSample != loudness::LKFS::kWindowSamples) {
                 throw std::runtime_error(
                     path.string() + ':' + std::to_string(lineNumber) +
                     " has invalid loudness sample indexes");
             }
-            block.startTenths =
-                *anchorTenths +
-                static_cast<std::int64_t>(
-                    (startSample - anchorSample) /
-                    loudness::LKFS::kHopSamples);
-            block.endTenths = block.startTenths + 4;
-            if (block.endTenths <= rangeStartTenths ||
-                block.startTenths >= rangeEndTenths) {
+            block.startNanoseconds =
+                parseCsvNanoseconds(fields[startIndex]);
+            block.endNanoseconds =
+                parseCsvNanoseconds(fields[endIndex]);
+            const std::int64_t rangeStartNanoseconds =
+                rangeStartTenths * 100000000LL;
+            const std::int64_t rangeEndNanoseconds =
+                rangeEndTenths * 100000000LL;
+            if (block.endNanoseconds <= rangeStartNanoseconds ||
+                block.startNanoseconds >= rangeEndNanoseconds) {
                 continue;
             }
             block.value = std::stod(fields[valueIndex]);
@@ -739,17 +727,17 @@ std::vector<Momentary> loadMomentaries(
 
     std::sort(result.begin(), result.end(),
               [](const Momentary& left, const Momentary& right) {
-                  if (left.startTenths != right.startTenths) {
-                      return left.startTenths < right.startTenths;
+                  if (left.startNanoseconds != right.startNanoseconds) {
+                      return left.startNanoseconds < right.startNanoseconds;
                   }
-                  return left.endTenths < right.endTenths;
+                  return left.endNanoseconds < right.endNanoseconds;
               });
     for (std::size_t i = 1; i < result.size(); ++i) {
-        if (result[i - 1].startTenths == result[i].startTenths &&
-            result[i - 1].endTenths == result[i].endTenths) {
+        if (result[i - 1].startNanoseconds == result[i].startNanoseconds &&
+            result[i - 1].endNanoseconds == result[i].endNanoseconds) {
             throw std::runtime_error(
                 "Overlapping M-LKFS logs contain duplicate block at " +
-                std::to_string(result[i].startTenths));
+                std::to_string(result[i].startNanoseconds));
         }
     }
     if (!result.empty()) {
@@ -769,25 +757,36 @@ std::size_t calculateLoudness(std::vector<Program>& programs,
                               const std::vector<Momentary>& blocks) {
     std::size_t incomplete = 0;
     for (Program& program : programs) {
+        const std::int64_t programStartNanoseconds =
+            program.startTenths * 100000000LL;
+        const std::int64_t programEndNanoseconds =
+            program.endTenths * 100000000LL;
         const auto first = std::lower_bound(
-            blocks.begin(), blocks.end(), program.startTenths,
+            blocks.begin(), blocks.end(), programStartNanoseconds,
             [](const Momentary& block, std::int64_t start) {
-                return block.startTenths < start;
+                return block.startNanoseconds < start;
             });
         std::vector<double> values;
         std::string filter;
         bool contiguous = true;
+        std::optional<std::int64_t> previousStart;
         for (auto current = first; current != blocks.end() &&
-             current->startTenths < program.endTenths; ++current) {
-            if (current->startTenths >= program.startTenths &&
-                current->endTenths <= program.endTenths) {
-                const std::int64_t expectedStart =
-                    program.startTenths +
-                    static_cast<std::int64_t>(values.size());
-                if (current->startTenths != expectedStart ||
-                    current->endTenths != current->startTenths + 4) {
+             current->startNanoseconds < programEndNanoseconds; ++current) {
+            if (current->startNanoseconds >= programStartNanoseconds &&
+                current->endNanoseconds <= programEndNanoseconds) {
+                const std::int64_t duration =
+                    current->endNanoseconds - current->startNanoseconds;
+                if (duration < 350000000LL || duration > 450000000LL) {
                     contiguous = false;
                 }
+                if (previousStart) {
+                    const std::int64_t hop =
+                        current->startNanoseconds - *previousStart;
+                    if (hop < 50000000LL || hop > 150000000LL) {
+                        contiguous = false;
+                    }
+                }
+                previousStart = current->startNanoseconds;
                 if (filter.empty()) filter = current->filter;
                 if (current->filter != filter) {
                     throw std::runtime_error(
@@ -797,8 +796,11 @@ std::size_t calculateLoudness(std::vector<Program>& programs,
             }
         }
         program.blockCount = values.size();
-        if (!contiguous ||
-            program.blockCount != program.expectedBlockCount) {
+        const std::size_t countDifference =
+            program.blockCount > program.expectedBlockCount
+                ? program.blockCount - program.expectedBlockCount
+                : program.expectedBlockCount - program.blockCount;
+        if (!contiguous || countDifference > 1) {
             ++incomplete;
             continue;
         }

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
@@ -61,8 +62,8 @@ void writeLe32(std::ostream& output, std::uint32_t value) {
 
 struct WavSource {
     std::filesystem::path path;
-    std::int64_t startFrame = 0;
-    std::int64_t endFrame = 0;
+    std::int64_t startNanoseconds = 0;
+    std::int64_t endNanoseconds = 0;
     std::uint64_t dataOffset = 0;
     std::uint64_t dataBytes = 0;
     std::uint32_t sampleRate = 0;
@@ -71,9 +72,8 @@ struct WavSource {
     std::uint16_t blockAlign = 0;
 };
 
-std::optional<std::int64_t> filenameStartFrame(
-    const std::filesystem::path& path,
-    std::uint32_t sampleRate) {
+std::optional<std::int64_t> filenameStartNanoseconds(
+    const std::filesystem::path& path) {
     const std::string name = path.filename().string();
     if (name.size() < 23 || name.substr(19, 4) != ".wav") {
         if (name.size() < 30 ||
@@ -90,27 +90,11 @@ std::optional<std::int64_t> filenameStartFrame(
     if (localAsUtc == static_cast<std::time_t>(-1)) return std::nullopt;
     const std::int64_t utcSeconds =
         static_cast<std::int64_t>(localAsUtc) - kSeoulUtcOffsetSeconds;
-    return utcSeconds * static_cast<std::int64_t>(sampleRate);
+    return utcSeconds * 1000000000LL;
 }
 
-std::optional<std::int64_t> csvStartFrame(
-    const std::filesystem::path& wavPath,
-    std::uint32_t sampleRate) {
-    const std::string stem = wavPath.stem().string();
-    std::string csvName;
-    if (stem.size() > 19 && stem.compare(19, 5, "_part") == 0) {
-        csvName = stem.substr(0, 19) + "_mlkfs" + stem.substr(19) + ".csv";
-    } else {
-        csvName = stem + "_mlkfs.csv";
-    }
-    std::ifstream input(wavPath.parent_path() / csvName);
-    std::string header;
-    std::string row;
-    if (!input || !std::getline(input, header) || !std::getline(input, row)) {
-        return std::nullopt;
-    }
-    const std::size_t comma = row.find(',');
-    const std::string timestamp = row.substr(0, comma);
+std::optional<std::int64_t> parseKstTimestampNanoseconds(
+    const std::string& timestamp) {
     if (timestamp.size() < 19) return std::nullopt;
     std::string base = timestamp.substr(0, 19);
     std::replace(base.begin(), base.end(), 'T', ' ');
@@ -120,15 +104,51 @@ std::optional<std::int64_t> csvStartFrame(
     if (!parser) return std::nullopt;
     const std::time_t localAsUtc = timegm(&value);
     if (localAsUtc == static_cast<std::time_t>(-1)) return std::nullopt;
-    int tenth = 0;
-    if (timestamp.size() > 20 && timestamp[19] == '.' &&
-        std::isdigit(static_cast<unsigned char>(timestamp[20]))) {
-        tenth = timestamp[20] - '0';
+    std::int64_t nanoseconds = 0;
+    if (timestamp.size() > 20 && timestamp[19] == '.') {
+        std::size_t position = 20;
+        int digits = 0;
+        while (position < timestamp.size() &&
+               std::isdigit(static_cast<unsigned char>(timestamp[position])) &&
+               digits < 9) {
+            nanoseconds = nanoseconds * 10 + (timestamp[position] - '0');
+            ++position;
+            ++digits;
+        }
+        while (digits++ < 9) nanoseconds *= 10;
     }
-    const std::int64_t utcTenths =
-        (static_cast<std::int64_t>(localAsUtc) -
-         kSeoulUtcOffsetSeconds) * 10 + tenth;
-    return utcTenths * static_cast<std::int64_t>(sampleRate) / 10;
+    return (static_cast<std::int64_t>(localAsUtc) -
+            kSeoulUtcOffsetSeconds) * 1000000000LL + nanoseconds;
+}
+
+std::optional<std::pair<std::int64_t, std::int64_t>> timingInterval(
+    const std::filesystem::path& wavPath) {
+    std::filesystem::path timingPath = wavPath;
+    timingPath.replace_extension(".timing.csv");
+    std::ifstream input(timingPath);
+    std::string header;
+    std::string row;
+    if (!input || !std::getline(input, header) || !std::getline(input, row)) {
+        return std::nullopt;
+    }
+    const std::size_t firstComma = row.find(',');
+    const std::size_t secondComma =
+        firstComma == std::string::npos
+            ? std::string::npos
+            : row.find(',', firstComma + 1);
+    if (firstComma == std::string::npos || secondComma == std::string::npos) {
+        throw std::runtime_error("Invalid WAV timing metadata: " +
+                                 timingPath.string());
+    }
+    const auto start = parseKstTimestampNanoseconds(
+        row.substr(0, firstComma));
+    const auto end = parseKstTimestampNanoseconds(
+        row.substr(firstComma + 1, secondComma - firstComma - 1));
+    if (!start || !end || *end <= *start) {
+        throw std::runtime_error("Invalid WAV timing interval: " +
+                                 timingPath.string());
+    }
+    return std::make_pair(*start, *end);
 }
 
 WavSource readWavSource(const std::filesystem::path& path) {
@@ -180,10 +200,10 @@ WavSource readWavSource(const std::filesystem::path& path) {
         source.blockAlign == 0 || source.channels == 0) {
         throw std::runtime_error("Incomplete WAV header: " + path.string());
     }
-    auto start = csvStartFrame(path, source.sampleRate);
-    if (!start) {
-        start = filenameStartFrame(path, source.sampleRate);
-    }
+    const auto interval = timingInterval(path);
+    auto start = interval
+        ? std::optional<std::int64_t>(interval->first)
+        : filenameStartNanoseconds(path);
     if (!start) {
         throw std::runtime_error(
             "WAV filename does not contain a Seoul start time: " +
@@ -196,14 +216,17 @@ WavSource readWavSource(const std::filesystem::path& path) {
     source.dataBytes =
         std::min(source.dataBytes, actualSize - source.dataOffset);
     source.dataBytes -= source.dataBytes % source.blockAlign;
-    source.startFrame = *start;
+    source.startNanoseconds = *start;
     const std::uint64_t frames = source.dataBytes / source.blockAlign;
     if (frames > static_cast<std::uint64_t>(
                      std::numeric_limits<std::int64_t>::max())) {
         throw std::runtime_error("WAV is too large: " + path.string());
     }
-    source.endFrame =
-        source.startFrame + static_cast<std::int64_t>(frames);
+    source.endNanoseconds = interval
+        ? interval->second
+        : source.startNanoseconds + static_cast<std::int64_t>(
+              (static_cast<long double>(frames) * 1000000000.0L) /
+              static_cast<long double>(source.sampleRate));
     return source;
 }
 
@@ -225,8 +248,8 @@ std::vector<WavSource> loadSources(
     }
     std::sort(sources.begin(), sources.end(),
               [](const WavSource& left, const WavSource& right) {
-                  if (left.startFrame != right.startFrame) {
-                      return left.startFrame < right.startFrame;
+                  if (left.startNanoseconds != right.startNanoseconds) {
+                      return left.startNanoseconds < right.startNanoseconds;
                   }
                   return left.path < right.path;
               });
@@ -295,11 +318,12 @@ void writeWavHeader(std::ostream& output,
 }
 
 const WavSource* sourceAt(const std::vector<WavSource>& sources,
-                          std::int64_t frame) {
+                          std::int64_t nanoseconds) {
     const WavSource* found = nullptr;
     for (const WavSource& source : sources) {
-        if (source.startFrame > frame) break;
-        if (source.startFrame <= frame && source.endFrame > frame) {
+        if (source.startNanoseconds > nanoseconds) break;
+        if (source.startNanoseconds <= nanoseconds &&
+            source.endNanoseconds > nanoseconds) {
             if (found != nullptr) {
                 throw std::runtime_error(
                     "Overlapping WAV files: " + found->path.string() +
@@ -311,6 +335,20 @@ const WavSource* sourceAt(const std::vector<WavSource>& sources,
     return found;
 }
 
+std::int64_t frameAtWallTime(const WavSource& source,
+                             std::int64_t nanoseconds) {
+    const std::int64_t clamped = std::max(
+        source.startNanoseconds,
+        std::min(source.endNanoseconds, nanoseconds));
+    const std::uint64_t totalFrames = source.dataBytes / source.blockAlign;
+    const long double ratio =
+        static_cast<long double>(clamped - source.startNanoseconds) /
+        static_cast<long double>(source.endNanoseconds -
+                                 source.startNanoseconds);
+    return static_cast<std::int64_t>(std::llround(
+        ratio * static_cast<long double>(totalFrames)));
+}
+
 void copyClip(const std::vector<WavSource>& sources,
               const program_audio::Clip& clip,
               const std::filesystem::path& outputPath) {
@@ -318,16 +356,39 @@ void copyClip(const std::vector<WavSource>& sources,
         throw std::runtime_error("No WAV recordings were found");
     }
     const WavSource& format = sources.front();
-    if ((clip.startTenths * format.sampleRate) % 10 != 0) {
-        throw std::runtime_error("Clip start is not on an exact sample");
+    const std::int64_t startNanoseconds = clip.startTenths * 100000000LL;
+    const std::int64_t endNanoseconds = startNanoseconds +
+        clip.durationSeconds * 1000000000LL;
+
+    struct Span {
+        const WavSource* source;
+        std::int64_t firstFrame;
+        std::int64_t frameCount;
+    };
+    std::vector<Span> spans;
+    std::int64_t cursor = startNanoseconds;
+    std::uint64_t totalFrames = 0;
+    while (cursor < endNanoseconds) {
+        const WavSource* source = sourceAt(sources, cursor);
+        if (!source) {
+            throw std::runtime_error(
+                "No WAV data at programme offset " +
+                std::to_string((cursor - startNanoseconds) / 1000000000LL) +
+                " seconds");
+        }
+        const std::int64_t spanEnd =
+            std::min(endNanoseconds, source->endNanoseconds);
+        const std::int64_t firstFrame = frameAtWallTime(*source, cursor);
+        const std::int64_t lastFrame = frameAtWallTime(*source, spanEnd);
+        if (lastFrame <= firstFrame) {
+            throw std::runtime_error("Invalid zero-length WAV timing span: " +
+                                     source->path.string());
+        }
+        spans.push_back({source, firstFrame, lastFrame - firstFrame});
+        totalFrames += static_cast<std::uint64_t>(lastFrame - firstFrame);
+        cursor = spanEnd;
     }
-    const std::int64_t startFrame =
-        clip.startTenths * static_cast<std::int64_t>(format.sampleRate) / 10;
-    const std::int64_t frameCount =
-        clip.durationSeconds * static_cast<std::int64_t>(format.sampleRate);
-    const std::int64_t endFrame = startFrame + frameCount;
-    const std::uint64_t outputBytes =
-        static_cast<std::uint64_t>(frameCount) * format.blockAlign;
+    const std::uint64_t outputBytes = totalFrames * format.blockAlign;
 
     std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -337,15 +398,8 @@ void copyClip(const std::vector<WavSource>& sources,
     writeWavHeader(output, format, outputBytes);
 
     std::vector<char> buffer(kCopyBufferBytes);
-    std::int64_t cursor = startFrame;
-    while (cursor < endFrame) {
-        const WavSource* source = sourceAt(sources, cursor);
-        if (!source) {
-            throw std::runtime_error(
-                "No WAV data at programme offset " +
-                std::to_string((cursor - startFrame) / format.sampleRate) +
-                " seconds");
-        }
+    for (const Span& span : spans) {
+        const WavSource* source = span.source;
         if (source->sampleRate != format.sampleRate ||
             source->channels != format.channels ||
             source->bitsPerSample != format.bitsPerSample ||
@@ -353,13 +407,11 @@ void copyClip(const std::vector<WavSource>& sources,
             throw std::runtime_error(
                 "WAV format changed at " + source->path.string());
         }
-        const std::int64_t frames =
-            std::min(endFrame, source->endFrame) - cursor;
         std::uint64_t bytes =
-            static_cast<std::uint64_t>(frames) * format.blockAlign;
+            static_cast<std::uint64_t>(span.frameCount) * format.blockAlign;
         const std::uint64_t sourceByte =
             source->dataOffset +
-            static_cast<std::uint64_t>(cursor - source->startFrame) *
+            static_cast<std::uint64_t>(span.firstFrame) *
                 format.blockAlign;
         std::ifstream input(source->path, std::ios::binary);
         input.seekg(static_cast<std::streamoff>(sourceByte));
@@ -382,7 +434,6 @@ void copyClip(const std::vector<WavSource>& sources,
             }
             bytes -= count;
         }
-        cursor += frames;
     }
     output.close();
     if (!output) {

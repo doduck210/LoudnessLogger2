@@ -34,6 +34,10 @@ public:
         std::uint64_t droppedSampleFrames = 0;
         std::uint64_t insertedSilentFrames = 0;
         std::uint64_t writtenSampleFrames = 0;
+        std::uint64_t currentQueuedBytes = 0;
+        std::uint64_t maximumQueuedBytes = 0;
+        bool serverClockLocked = false;
+        double estimatedSampleRate = 0.0;
     };
 
     explicit WavSegmentWriter(Config config);
@@ -91,4 +95,8 @@ private:
     std::atomic<std::uint64_t> droppedSampleFrames_{0};
     std::atomic<std::uint64_t> insertedSilentFrames_{0};
     std::atomic<std::uint64_t> writtenSampleFrames_{0};
+    std::atomic<std::uint64_t> currentQueuedBytes_{0};
+    std::atomic<std::uint64_t> maximumQueuedBytes_{0};
+    std::atomic<bool> serverClockLocked_{false};
+    std::atomic<double> estimatedSampleRate_{0.0};
 };

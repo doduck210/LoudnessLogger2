@@ -11,13 +11,16 @@
 - SDK 콜백에서는 PCM 복사만 하고 파일 쓰기는 별도 thread가 수행한다.
 - 같은 writer thread에서 연속 K-weighting과 M-LKFS 계산을 수행한다. 기본 필터는
   과거 pyloudnorm 기본값과 같은 RBJ이며 `--lkfs-filter deman`도 선택할 수 있다.
-- M-LKFS는 게이팅하지 않은 400 ms 창을 서울 시각 100 ms 격자마다 계산한다.
+- M-LKFS는 게이팅하지 않은 400 ms 창을 100 ms 간격으로 계산한다.
   결과는 서울 정시 기준 한 시간 단위 `*_mlkfs.csv`에 `double` 정밀도로 저장한다.
-- 프로세스 시작 직후에는 다음 100 ms 경계 전까지의 최대 4,800 sample frame을
-  버리고 시간축을 정확한 `.0`/`.1` 격자에 맞춘다. 이후 정시 파일의 첫 M 블록은
-  항상 `HH:00:00.0`에서 시작한다.
+- 시작 후 약 5초 동안 DeckLink sample clock과 서버 clock을 보정하고, 다음 100 ms
+  서버 시각 경계부터 기록한다. 이 초기 보정 구간의 PCM은 의도적으로 버린다.
 - 서버 timezone 설정과 관계없이 서울 시각(KST, UTC+09:00) 기준으로 WAV 파일명을
   만들고 정시 경계에서 분할한다.
+- DeckLink hardware reference timestamp를 서버 시각에 연결하고 최근 30분의 clock
+  비율을 계속 추정한다. 따라서 SDI clock이 정확히 48,000 Hz가 아니어도 WAV는 서버
+  정시에서 바뀐다. 완전한 한 시간 WAV도 clock 차이만큼 sample 수와 파일 크기가
+  몇 frame 달라질 수 있으며 이것이 정상이다.
 - 녹음 형식은 SDI audio 1·2번 채널, 48 kHz, signed 32-bit little-endian PCM이다.
 - 파일 이름과 시간 단위 분할 방식은 기존 logger와 호환된다.
   - `YYYY-MM-DD_HH.00.00.wav` (정시에 시작된 segment)
@@ -82,17 +85,21 @@ inline const std::filesystem::path kStorageRoot = "/mnt/hdd";
 
 M-LKFS CSV는 WAV segment 길이와 관계없이 한 시간 단위다. 프로세스 시작 후 첫
 부분 파일은 WAV처럼 실제 시작 시각을 사용하고, 그다음부터 서울 정시에 분할한다.
-한 시간에 36,000개 값이 기록되며 크기는 대략 4 MB다. 파일명과 열은 다음과 같다.
+한 시간에 약 36,000개 값이 기록되며 크기는 대략 4 MB다. 각 블록의 시각은 보정된
+서버 시각이고 nanosecond 자릿수까지 기록한다. 파일명과 열은 다음과 같다.
 
 ```text
 2026-07-22_12.00.00_mlkfs.csv
 
 start_time_kst,end_time_kst,start_sample,end_sample,mlkfs,filter
-2026-07-22T12:00:00.0+09:00,2026-07-22T12:00:00.4+09:00,0,19200,-23.035004560596764,RBJ
+2026-07-22T12:00:00.000000000+09:00,2026-07-22T12:00:00.400000083+09:00,0,19200,-23.035004560596764,RBJ
 ```
 
 같은 시간대 파일이 이미 있으면 WAV와 마찬가지로 `_partNN`을 붙이며 덮어쓰지 않는다.
 CSV는 5초마다 flush한다. `--lkfs-filter`를 생략하면 `rbj`이고 `deman`도 가능하다.
+완료된 WAV 옆의 같은 이름 `.timing.csv`에는 실제 서버 시작·종료 시각과 sample
+범위가 저장된다. 편성 오디오 추출기는 이 metadata를 사용하므로 시간당 sample 수가
+달라도 정확한 서버 시각 위치에서 자른다.
 
 `--mode`를 생략하면 1080i59.94를 초기 mode로 사용하고, 지원 장치에서는 입력
 format detection을 켠다. 자동 감지가 불가능한 장치에서는 `--list-modes`로 확인한
@@ -108,8 +115,8 @@ index를 `--mode INDEX`로 지정한다.
 `loudness_report`는 지정 날짜의 편성표를 내부 API에서 받아 각 편성 구간에 완전히
 포함되는 M-LKFS 블록만 선택한다. 저장된 M 값을 에너지로 복원하고 −70 LKFS
 absolute gate와 −10 LU relative gate를 적용해 I-LKFS를 계산한다.
-CSV 표시 시각의 반올림 오차에 의존하지 않고 `start_sample`/`end_sample`로 100 ms
-블록 시간축을 재구성하므로 기존 장시간 로그도 정확히 처리한다.
+새 CSV는 각 블록에 기록된 보정 서버 시각을 직접 사용한다. 예전 한 자리 소수 CSV도
+계속 읽을 수 있다.
 
 ```bash
 make
