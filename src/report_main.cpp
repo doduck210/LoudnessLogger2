@@ -650,7 +650,8 @@ std::vector<Momentary> loadMomentaries(
     }
 
     std::vector<std::filesystem::path> paths;
-    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator(directory)) {
         if (!entry.is_regular_file()) continue;
         const std::string name = entry.path().filename().string();
         if (name.find("_mlkfs") != std::string::npos &&

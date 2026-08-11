@@ -137,6 +137,7 @@ function switchView(view) {
     calendar: "채널 캘린더",
     schedule: "편성표 관리",
     reports: "Loudness 리포트",
+    logs: "운영 로그",
     settings: "시스템 설정",
   };
   $$(".view").forEach((node) => node.classList.toggle("active", node.id === `${view}-view`));
@@ -152,6 +153,7 @@ function switchView(view) {
     loadReports();
     state.audioJobTimer = setInterval(loadAudioJobs, 1_000);
   }
+  if (view === "logs") loadLogs();
   if (view === "schedule") {
     state.programAudioTimer = setInterval(() => {
       const editing = ["INPUT", "SELECT", "TEXTAREA"].includes(
@@ -1155,6 +1157,97 @@ function renderAudioJobs(jobs) {
   log.scrollTop = log.scrollHeight;
 }
 
+async function loadLogs() {
+  try {
+    if (!state.settings) state.settings = await api("/api/settings");
+    const channelSelect = $("#log-channel");
+    const previousChannel = channelSelect.value;
+    channelSelect.replaceChildren(
+      ...state.settings.channels.map((channel) => {
+        const option = document.createElement("option");
+        option.value = channel.id;
+        option.textContent = channel.name;
+        return option;
+      }),
+    );
+    channelSelect.value = state.settings.channels.some(
+      (channel) => channel.id === previousChannel,
+    )
+      ? previousChannel
+      : state.settings.channels[0]?.id || "";
+    await loadLogIndex();
+  } catch (error) {
+    $("#log-viewer-content").textContent = error.message;
+    notify(error.message, true);
+  }
+}
+
+async function loadLogIndex() {
+  const channelId = $("#log-channel").value;
+  if (!channelId) return;
+  const previousDate = $("#log-date").value;
+  const index = await api(
+    `/api/logs/index?channelId=${encodeURIComponent(channelId)}`,
+  );
+  const dateSelect = $("#log-date");
+  dateSelect.replaceChildren(
+    ...index.dates.map((item) => {
+      const option = document.createElement("option");
+      option.value = item.date;
+      const types = [
+        item.recorder ? "REC" : "",
+        item.report ? "REPORT" : "",
+      ].filter(Boolean).join(" + ");
+      option.textContent = `${item.date}${types ? ` · ${types}` : ""}`;
+      option.dataset.recorder = String(item.recorder);
+      option.dataset.report = String(item.report);
+      return option;
+    }),
+  );
+  dateSelect.value = index.dates.some((item) => item.date === previousDate)
+    ? previousDate
+    : index.dates[0]?.date || "";
+  if (!dateSelect.value) {
+    $("#log-viewer-content").textContent = "저장된 로그가 없습니다.";
+    $("#log-viewer-meta").textContent = "로그 없음";
+    return;
+  }
+  selectAvailableLogType();
+  await loadLogContent();
+}
+
+function selectAvailableLogType() {
+  const selected = $("#log-date").selectedOptions[0];
+  const type = $("#log-type");
+  if (selected?.dataset[type.value] !== "true") {
+    type.value = selected?.dataset.recorder === "true" ? "recorder" : "report";
+  }
+}
+
+async function loadLogContent() {
+  const channelId = $("#log-channel").value;
+  const date = $("#log-date").value;
+  const type = $("#log-type").value;
+  if (!channelId || !date) return;
+  const content = $("#log-viewer-content");
+  content.textContent = "로그를 불러오는 중입니다.";
+  try {
+    const value = await api(
+      `/api/logs/content?channelId=${encodeURIComponent(channelId)}` +
+      `&date=${encodeURIComponent(date)}&type=${encodeURIComponent(type)}`,
+    );
+    const label = type === "recorder" ? "레코더" : "리포트 · 편성 오디오";
+    $("#log-viewer-title").textContent = `${value.channelName} · ${label}`;
+    $("#log-viewer-meta").textContent =
+      `${date} KST${value.truncated ? " · 마지막 500,000자 표시" : ""}`;
+    content.textContent = value.content || "해당 날짜의 로그가 없습니다.";
+    content.scrollTop = content.scrollHeight;
+  } catch (error) {
+    content.textContent = error.message;
+    notify(error.message, true);
+  }
+}
+
 async function loadSettings() {
   try {
     [state.settings, state.scheduler] = await Promise.all([
@@ -1188,7 +1281,12 @@ const retentionFields = [
   {
     key: "recorderLogsDays",
     selector: "#retention-recorder-logs",
-    shortLabel: "로그",
+    shortLabel: "레코더 로그",
+  },
+  {
+    key: "reportLogsDays",
+    selector: "#retention-report-logs",
+    shortLabel: "리포트 로그",
   },
 ];
 
@@ -1393,6 +1491,7 @@ function renderCleanupStatus() {
     Number(cleanup.mlkfs?.bytes || 0) +
     Number(cleanup.schedules?.bytes || 0) +
     Number(cleanup.reports?.bytes || 0) +
+    Number(cleanup.reportLogs?.bytes || 0) +
     Number(cleanup.operationalLogs?.bytes || 0);
   node.textContent =
     `최근 정리: ${executed} · ` +
@@ -1401,6 +1500,7 @@ function renderCleanupStatus() {
     `편성 오디오 ${cleanup.programAudio?.directories || 0}일 · ` +
     `편성표 ${cleanup.schedules?.files || 0}개 · ` +
     `리포트 ${cleanup.reports?.files || 0}개 · ` +
+    `리포트 로그 ${cleanup.reportLogs?.files || 0}개 · ` +
     `로그 압축 ${cleanup.operationalLogs?.rotatedFiles || 0}개 · ` +
     `확인된 용량 ${formatBytes(deletedBytes)} · ` +
     `오류 ${cleanup.errors?.length || 0}개`;
@@ -1425,6 +1525,7 @@ function addChannel() {
       schedulesDays: 0,
       reportsDays: 0,
       recorderLogsDays: 0,
+      reportLogsDays: 0,
     },
   });
   renderSettings();
@@ -1461,6 +1562,13 @@ $$("[data-view-link]").forEach((button) =>
   button.addEventListener("click", () => switchView(button.dataset.viewLink)),
 );
 $("#refresh-view").addEventListener("click", () => switchView(state.view));
+$("#log-channel").addEventListener("change", () => void loadLogIndex());
+$("#log-date").addEventListener("change", () => {
+  selectAvailableLogType();
+  void loadLogContent();
+});
+$("#log-type").addEventListener("change", () => void loadLogContent());
+$("#load-log").addEventListener("click", () => void loadLogContent());
 $("#theme-toggle").addEventListener("click", () => {
   applyTheme(
     document.documentElement.dataset.theme === "light" ? "dark" : "light",

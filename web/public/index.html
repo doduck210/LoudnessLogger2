@@ -42,6 +42,9 @@
           <button class="nav-item" data-view="reports">
             <span class="nav-icon">↧</span>리포트
           </button>
+          <button class="nav-item" data-view="logs">
+            <span class="nav-icon">≣</span>로그
+          </button>
           <button class="nav-item" data-view="settings">
             <span class="nav-icon">⚙</span>설정
           </button>
@@ -306,6 +309,33 @@
           </article>
         </section>
 
+        <section id="logs-view" class="view">
+          <div class="toolbar panel log-toolbar">
+            <label>채널<select id="log-channel"></select></label>
+            <label>날짜<select id="log-date"></select></label>
+            <label>
+              로그 종류
+              <select id="log-type">
+                <option value="recorder">레코더</option>
+                <option value="report">리포트 · 편성 오디오</option>
+              </select>
+            </label>
+            <div class="toolbar-actions">
+              <button id="load-log" class="button primary" type="button">로그 보기</button>
+            </div>
+          </div>
+          <article class="panel log-viewer-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">DAILY OPERATION LOG</p>
+                <h2 id="log-viewer-title">날짜별 실행 로그</h2>
+              </div>
+              <span id="log-viewer-meta" class="muted">채널과 날짜를 선택하세요.</span>
+            </div>
+            <pre id="log-viewer-content" class="log-viewer-content">로그를 불러오는 중입니다.</pre>
+          </article>
+        </section>
+
         <section id="settings-view" class="view">
           <article class="panel settings-panel">
             <div class="panel-head">
@@ -441,6 +471,7 @@
           <label>편성표 JSON<span class="retention-input"><input id="retention-schedules" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
           <label>리포트 XLSX<span class="retention-input"><input id="retention-reports" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
           <label>레코더 로그<span class="retention-input"><input id="retention-recorder-logs" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
+          <label>리포트 로그<span class="retention-input"><input id="retention-report-logs" type="number" min="0" max="3650" step="1" /><span>일</span></span></label>
         </div>
         <div class="retention-common">
           <div>

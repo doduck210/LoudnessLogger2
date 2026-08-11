@@ -52,6 +52,27 @@ std::string timestampForFilename(std::chrono::system_clock::time_point time) {
     return output.str();
 }
 
+std::string dateForDirectory(std::chrono::system_clock::time_point time) {
+    const std::time_t raw = std::chrono::system_clock::to_time_t(time);
+    const std::tm seoul = seoulTime(raw);
+    std::ostringstream output;
+    output << std::put_time(&seoul, "%Y-%m-%d");
+    return output.str();
+}
+
+std::filesystem::path datedOutputDirectory(
+    const std::filesystem::path& root,
+    std::chrono::system_clock::time_point time) {
+    const auto directory = root / dateForDirectory(time);
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) {
+        throw std::runtime_error("Could not create dated output directory: " +
+                                 error.message());
+    }
+    return directory;
+}
+
 std::string timestampForCsv(std::chrono::system_clock::time_point time) {
     const auto sinceEpoch = std::chrono::duration_cast<std::chrono::nanoseconds>(
         time.time_since_epoch());
@@ -166,34 +187,6 @@ std::filesystem::path uniqueLoudnessPath(
         }
     }
     throw std::runtime_error("Could not choose a unique loudness filename for " + stem);
-}
-
-void writeTimingSidecar(
-    const std::filesystem::path& wavPath,
-    std::chrono::system_clock::time_point start,
-    std::chrono::system_clock::time_point end,
-    std::int64_t startSample,
-    std::int64_t endSample,
-    std::uint32_t sampleRate,
-    double estimatedSampleRate) {
-    std::filesystem::path path = wavPath;
-    path.replace_extension(".timing.csv");
-    std::ofstream output(path, std::ios::out | std::ios::trunc);
-    if (!output) {
-        throw std::runtime_error("Could not create WAV timing metadata: " +
-                                 path.string());
-    }
-    output << "start_time_kst,end_time_kst,start_sample,end_sample,"
-              "nominal_sample_rate,estimated_sample_rate\n"
-           << timestampForCsv(start) << ',' << timestampForCsv(end) << ','
-           << startSample << ',' << endSample << ',' << sampleRate << ','
-           << std::setprecision(std::numeric_limits<double>::max_digits10)
-           << estimatedSampleRate << '\n';
-    output.close();
-    if (!output) {
-        throw std::runtime_error("Could not finish WAV timing metadata: " +
-                                 path.string());
-    }
 }
 
 const char* loudnessFilterName(loudness::LKFS::FilterType filterType) {
@@ -602,7 +595,6 @@ void WavSegmentWriter::writerLoop() {
         std::chrono::system_clock::time_point fallbackWallOrigin;
         std::chrono::system_clock::time_point nextBoundary;
         std::int64_t nextBoundaryFrame = 0;
-        std::chrono::system_clock::time_point segmentStartWall;
         std::int64_t segmentStartFrame = 0;
 
         auto wallForOutputFrame = [&](std::int64_t frame) {
@@ -632,7 +624,9 @@ void WavSegmentWriter::writerLoop() {
                     const auto filenameTime =
                         loudnessFileHasBeenOpened ? hour : blockStart;
                     const auto path = uniqueLoudnessPath(
-                        config_.outputDirectory, filenameTime);
+                        datedOutputDirectory(config_.outputDirectory,
+                                             filenameTime),
+                        filenameTime);
                     loudnessFile.emplace(path, config_.loudnessFilter,
                                          config_.headerCheckpointInterval);
                     loudnessFileHour = hour;
@@ -672,26 +666,19 @@ void WavSegmentWriter::writerLoop() {
             }
         };
 
-        auto closeFile = [&](std::chrono::system_clock::time_point end) {
+        auto closeFile = [&]() {
             if (file) {
                 std::cerr << "Closing WAV: " << file->path() << '\n';
-                const auto path = file->path();
                 file->close();
                 file.reset();
-                writeTimingSidecar(path, segmentStartWall, end,
-                                   segmentStartFrame, outputFrame,
-                                   config_.sampleRate,
-                                   sourceClockAvailable
-                                       ? clockMapper.estimatedSampleRate()
-                                       : static_cast<double>(config_.sampleRate));
             }
         };
 
         auto openFile = [&](std::chrono::system_clock::time_point start) {
-            const auto path = uniqueWavPath(config_.outputDirectory, start);
+            const auto path = uniqueWavPath(
+                datedOutputDirectory(config_.outputDirectory, start), start);
             file.emplace(path, config_.sampleRate, config_.channels,
                          config_.bitsPerSample, config_.headerCheckpointInterval);
-            segmentStartWall = start;
             segmentStartFrame = outputFrame;
             std::cerr << "Opening WAV: " << path << '\n';
         };
@@ -711,7 +698,7 @@ void WavSegmentWriter::writerLoop() {
             while (outputFrame >= nextBoundaryFrame) {
                 const std::int64_t framesInSegment =
                     outputFrame - segmentStartFrame;
-                closeFile(nextBoundary);
+                closeFile();
                 std::cerr << "Server-time boundary reached: "
                           << timestampForCsv(nextBoundary)
                           << ", segment_frames=" << framesInSegment
@@ -864,7 +851,7 @@ void WavSegmentWriter::writerLoop() {
         }
 
         if (file) {
-            closeFile(wallForOutputFrame(outputFrame));
+            closeFile();
         }
         if (loudnessFile) {
             std::cerr << "Closing loudness log: " << loudnessFile->path() << '\n';

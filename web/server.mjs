@@ -1,10 +1,12 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import {
+  appendFile,
   mkdir,
   readFile,
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   statfs,
   truncate,
@@ -17,7 +19,12 @@ import { randomUUID } from "node:crypto";
 import { dirname, extname, isAbsolute, join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
-import { createDeflateRaw, createGzip, inflateRawSync } from "node:zlib";
+import {
+  createDeflateRaw,
+  createGzip,
+  gunzipSync,
+  inflateRawSync,
+} from "node:zlib";
 
 const webDirectory = dirname(fileURLToPath(import.meta.url));
 const projectDirectory = resolve(webDirectory, "..");
@@ -47,6 +54,7 @@ const config = Object.freeze({
   runtimeSettingsFile: resolve(serverSettings.runtimeSettingsFile),
   schedulerStateFile: resolve(serverSettings.schedulerStateFile),
   logsDirectory: resolve(serverSettings.logsDirectory),
+  reportLogsDirectory: resolve(serverSettings.logsDirectory, "reports"),
 });
 
 const defaultRuntimeSettings = Object.freeze({
@@ -72,6 +80,7 @@ const defaultRuntimeSettings = Object.freeze({
         schedulesDays: 0,
         reportsDays: 0,
         recorderLogsDays: 0,
+        reportLogsDays: 0,
       },
     },
     {
@@ -87,6 +96,7 @@ const defaultRuntimeSettings = Object.freeze({
         schedulesDays: 0,
         reportsDays: 0,
         recorderLogsDays: 0,
+        reportLogsDays: 0,
       },
     },
     {
@@ -102,6 +112,7 @@ const defaultRuntimeSettings = Object.freeze({
         schedulesDays: 0,
         reportsDays: 0,
         recorderLogsDays: 0,
+        reportLogsDays: 0,
       },
     },
   ],
@@ -119,6 +130,7 @@ await Promise.all([
   mkdir(config.reportsDirectory, { recursive: true }),
   mkdir(config.programAudioDirectory, { recursive: true }),
   mkdir(config.logsDirectory, { recursive: true }),
+  mkdir(config.reportLogsDirectory, { recursive: true }),
 ]);
 let runtimeSettings = await loadRuntimeSettings();
 let schedulerState = await loadSchedulerState();
@@ -194,6 +206,7 @@ function validateRuntimeSettings(value) {
       schedulesDays: retentionValue("schedulesDays", "편성표"),
       reportsDays: retentionValue("reportsDays", "리포트"),
       recorderLogsDays: retentionValue("recorderLogsDays", "레코더 로그"),
+      reportLogsDays: retentionValue("reportLogsDays", "리포트 로그"),
     };
   };
   if (
@@ -339,6 +352,10 @@ async function loadSchedulerState() {
           : null,
       lastCleanupAt:
         typeof value.lastCleanupAt === "string" ? value.lastCleanupAt : null,
+      lastLogRotationDateKst:
+        typeof value.lastLogRotationDateKst === "string"
+          ? value.lastLogRotationDateKst
+          : null,
       cleanupResult:
         value.cleanupResult && typeof value.cleanupResult === "object"
           ? value.cleanupResult
@@ -357,6 +374,7 @@ async function loadSchedulerState() {
       results: [],
       lastCleanupDateKst: null,
       lastCleanupAt: null,
+      lastLogRotationDateKst: null,
       cleanupResult: null,
     };
   }
@@ -612,7 +630,7 @@ async function rangeArchiveEntries(channel, range) {
       error.message;
   }
   const [recordingEntries, reportEntries] = await Promise.all([
-    readdir(channel.recordingsDirectory, { withFileTypes: true }),
+    recordingDirectoryFiles(channel.recordingsDirectory),
     readdir(config.reportsDirectory, { withFileTypes: true }),
   ]);
   const rootName =
@@ -632,7 +650,6 @@ async function rangeArchiveEntries(channel, range) {
   const mlkfsPattern =
     /^(\d{4}-\d{2}-\d{2})_(\d{2})\.(\d{2})\.(\d{2})_mlkfs(?:_part\d+)?\.csv$/;
   for (const entry of recordingEntries) {
-    if (!entry.isFile()) continue;
     const match = mlkfsPattern.exec(entry.name);
     if (!match) continue;
     const date = match[1];
@@ -650,7 +667,7 @@ async function rangeArchiveEntries(channel, range) {
       counts.set(date, { reports: 0, mlkfs: 0 });
     }
     files.push({
-      sourcePath: join(channel.recordingsDirectory, entry.name),
+      sourcePath: entry.path,
       archivePath: `${rootName}/mlkfs/${date}/${entry.name}`,
     });
     counts.get(date).mlkfs += 1;
@@ -961,11 +978,161 @@ async function directoryFiles(directory, predicate = () => true) {
   }
 }
 
+async function recordingDirectoryFiles(directory, predicate = () => true) {
+  let rootEntries;
+  try {
+    rootEntries = await readdir(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  const files = [];
+  const addFiles = async (parent, entries) => {
+    for (const entry of entries) {
+      if (!entry.isFile() || !predicate(entry.name)) continue;
+      const path = join(parent, entry.name);
+      const info = await stat(path);
+      files.push({
+        name: entry.name,
+        path,
+        size: info.size,
+        modifiedAt: info.mtime.toISOString(),
+      });
+    }
+  };
+  await addFiles(directory, rootEntries);
+  for (const entry of rootEntries) {
+    if (!entry.isDirectory() || !validFileDate(entry.name)) continue;
+    const datedDirectory = join(directory, entry.name);
+    await addFiles(
+      datedDirectory,
+      await readdir(datedDirectory, { withFileTypes: true }),
+    );
+  }
+  return files.sort((left, right) =>
+    right.modifiedAt.localeCompare(left.modifiedAt),
+  );
+}
+
+const maxViewedLogCharacters = 500_000;
+
+async function logArchiveIndex(channel) {
+  const dates = new Map();
+  const mark = (date, type) => {
+    if (!dates.has(date)) dates.set(date, { date, recorder: false, report: false });
+    dates.get(date)[type] = true;
+  };
+  let rootNames = [];
+  try {
+    rootNames = await readdir(config.logsDirectory);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  const recorderPattern = new RegExp(
+    `^${escapeRegExp(channel.recorderLogName)}\\.(\\d{4}-\\d{2}-\\d{2})` +
+      `(?:_part\\d+)?\\.gz$`,
+  );
+  for (const name of rootNames) {
+    const date = recorderPattern.exec(name)?.[1];
+    if (date) mark(date, "recorder");
+  }
+  try {
+    const current = await stat(join(config.logsDirectory, channel.recorderLogName));
+    if (current.isFile() && current.size > 0) {
+      mark(kstNowParts().date, "recorder");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  try {
+    const reportNames = await readdir(
+      join(config.reportLogsDirectory, channel.id),
+    );
+    for (const name of reportNames) {
+      const date = /^(\d{4}-\d{2}-\d{2})\.log$/.exec(name)?.[1];
+      if (date) mark(date, "report");
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  return [...dates.values()].sort((left, right) =>
+    right.date.localeCompare(left.date, "en"),
+  );
+}
+
+async function readLogText(path, compressed = false) {
+  const data = await readFile(path);
+  return compressed ? gunzipSync(data).toString("utf8") : data.toString("utf8");
+}
+
+async function recorderLogContent(channel, date) {
+  let names = [];
+  try {
+    names = await readdir(config.logsDirectory);
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  }
+  const pattern = new RegExp(
+    `^${escapeRegExp(channel.recorderLogName)}\\.${escapeRegExp(date)}` +
+      `(?:_part\\d+)?\\.gz$`,
+  );
+  const paths = names
+    .filter((name) => pattern.test(name))
+    .sort((left, right) => left.localeCompare(right, "en"))
+    .map((name) => join(config.logsDirectory, name));
+  const parts = [];
+  for (const path of paths) {
+    parts.push(await readLogText(path, true));
+  }
+  if (date === kstNowParts().date) {
+    try {
+      parts.push(
+        await readLogText(join(config.logsDirectory, channel.recorderLogName)),
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return parts.join("\n");
+}
+
+async function reportLogContent(channel, date) {
+  try {
+    return await readLogText(
+      join(config.reportLogsDirectory, channel.id, `${date}.log`),
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+function limitedLogContent(content) {
+  if (content.length <= maxViewedLogCharacters) {
+    return { content, truncated: false };
+  }
+  return {
+    content:
+      "[웹 표시 한도를 초과하여 마지막 500,000자만 표시합니다.]\n\n" +
+      content.slice(-maxViewedLogCharacters),
+    truncated: true,
+  };
+}
+
 async function channelStatus(channel) {
   try {
-    const recordings = await directoryFiles(
+    const wanted = (name) =>
+      name.endsWith(".wav") || name.endsWith("_mlkfs.csv");
+    const todayDirectory = join(
       channel.recordingsDirectory,
-      (name) => name.endsWith(".wav") || name.endsWith("_mlkfs.csv"),
+      kstNowParts().date,
+    );
+    const recordings = [
+      ...(await directoryFiles(todayDirectory, wanted)),
+      ...(await directoryFiles(channel.recordingsDirectory, wanted)),
+    ].sort((left, right) =>
+      right.modifiedAt.localeCompare(left.modifiedAt),
     );
     const latestWav = recordings.find((file) => file.name.endsWith(".wav"));
     const latestCsv = recordings.find((file) =>
@@ -1069,10 +1236,47 @@ function publicAudioJob(job) {
 }
 
 function appendJobOutput(job, chunk) {
-  job.output += chunk.toString("utf8");
+  const text = chunk.toString("utf8");
+  job.output += text;
   if (job.output.length > maxJobLogCharacters) {
     job.output = job.output.slice(-maxJobLogCharacters);
   }
+  if (job.logPath && !job.logWriteError) {
+    job.logWrite = (job.logWrite || Promise.resolve())
+      .then(() => appendFile(job.logPath, text, { mode: 0o640 }))
+      .catch((error) => {
+        job.logWriteError = error.message;
+        console.error(`작업 로그 저장 실패 (${job.logPath}): ${error.message}`);
+      });
+  }
+}
+
+function configureJobLog(job, kind) {
+  const directory = join(config.reportLogsDirectory, job.channelId);
+  job.logPath = join(directory, `${job.date}.log`);
+  job.logWriteError = null;
+  job.logWrite = mkdir(directory, { recursive: true });
+  const startedAt = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Seoul",
+    dateStyle: "short",
+    timeStyle: "medium",
+    hourCycle: "h23",
+  }).format(new Date());
+  appendJobOutput(
+    job,
+    `\n===== ${kind} 시작 · ${job.channelName} · ${job.date} · ${startedAt} KST =====\n`,
+  );
+}
+
+async function appendReportFailure(channel, date, message) {
+  const directory = join(config.reportLogsDirectory, channel.id);
+  await mkdir(directory, { recursive: true });
+  await appendFile(
+    join(directory, `${date}.log`),
+    `\n===== 라우드니스 리포트 시작 실패 · ${channel.name} · ${date} =====\n` +
+      `${message}\n===== 라우드니스 리포트 종료 · 상태=failed =====\n`,
+    { mode: 0o640 },
+  );
 }
 
 function enqueueAudioJob(channel, date) {
@@ -1100,6 +1304,7 @@ function enqueueAudioJob(channel, date) {
     audioOutputPath: programAudioPath(channel, date),
   };
   audioJobs.set(job.id, job);
+  configureJobLog(job, "편성 오디오");
   audioQueue.push(job);
   while (audioJobs.size > 100) {
     const oldest = audioJobs.keys().next().value;
@@ -1150,6 +1355,10 @@ async function runNextAudioJob() {
     job.exitCode = code;
     job.state = state;
     job.finishedAt = new Date().toISOString();
+    appendJobOutput(
+      job,
+      `\n===== 편성 오디오 종료 · 상태=${state} · exit=${code ?? "없음"} =====\n`,
+    );
     audioWorkerBusy = false;
     void runNextAudioJob();
   };
@@ -1160,7 +1369,17 @@ async function runNextAudioJob() {
 }
 
 async function startReportJob(channel, date) {
-  const inputSchedulePath = await existingSchedulePath(channel, date);
+  let inputSchedulePath;
+  try {
+    inputSchedulePath = await existingSchedulePath(channel, date);
+  } catch (error) {
+    try {
+      await appendReportFailure(channel, date, error.message);
+    } catch (logError) {
+      console.error(`리포트 실패 로그 저장 오류: ${logError.message}`);
+    }
+    throw error;
+  }
   for (const job of jobs.values()) {
     if (job.state === "running" || job.state === "queued") {
       throw httpError(409, "이미 리포트 계산 작업이 실행 중입니다.");
@@ -1185,6 +1404,7 @@ async function startReportJob(channel, date) {
     job.resolveCompletion = resolveCompletion;
   });
   jobs.set(id, job);
+  configureJobLog(job, "라우드니스 리포트");
   while (jobs.size > 100) {
     const oldest = jobs.keys().next().value;
     if (["queued", "running"].includes(jobs.get(oldest)?.state)) break;
@@ -1218,6 +1438,7 @@ async function startReportJob(channel, date) {
     job.state = "failed";
     job.finishedAt = new Date().toISOString();
     appendJobOutput(job, `\n${error.message}\n`);
+    appendJobOutput(job, "===== 라우드니스 리포트 종료 · 상태=failed =====\n");
     job.resolveCompletion(job);
   });
   child.on("close", (code) => {
@@ -1231,6 +1452,10 @@ async function startReportJob(channel, date) {
         `\n편성 오디오는 백그라운드 작업 ${audioJob.id}에서 생성됩니다.\n`,
       );
     }
+    appendJobOutput(
+      job,
+      `===== 라우드니스 리포트 종료 · 상태=${job.state} · exit=${code} =====\n`,
+    );
     job.resolveCompletion(job);
   });
   return job;
@@ -1315,8 +1540,28 @@ async function cleanupFlatFiles({
     result.errors.push(`${category}: ${error.message}`);
     return;
   }
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
+  const candidates = entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => ({ entry, parent: directory }));
+  const datedDirectories = entries.filter(
+    (entry) => entry.isDirectory() && validFileDate(entry.name),
+  );
+  for (const dateEntry of datedDirectories) {
+    const parent = join(directory, dateEntry.name);
+    try {
+      const children = await readdir(parent, { withFileTypes: true });
+      candidates.push(
+        ...children
+          .filter((entry) => entry.isFile())
+          .map((entry) => ({ entry, parent })),
+      );
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        result.errors.push(`${parent}: ${error.message}`);
+      }
+    }
+  }
+  for (const { entry, parent } of candidates) {
     const date = pattern.exec(entry.name)?.[1];
     if (
       !date ||
@@ -1326,7 +1571,7 @@ async function cleanupFlatFiles({
     ) {
       continue;
     }
-    const path = join(directory, entry.name);
+    const path = join(parent, entry.name);
     try {
       const info = await stat(path);
       await unlink(path);
@@ -1334,6 +1579,16 @@ async function cleanupFlatFiles({
       result[category].bytes += info.size;
     } catch (error) {
       if (error?.code !== "ENOENT") {
+        result.errors.push(`${path}: ${error.message}`);
+      }
+    }
+  }
+  for (const dateEntry of datedDirectories) {
+    const path = join(directory, dateEntry.name);
+    try {
+      await rmdir(path);
+    } catch (error) {
+      if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error?.code)) {
         result.errors.push(`${path}: ${error.message}`);
       }
     }
@@ -1448,7 +1703,6 @@ async function cleanupOperationalLogs(runDate, result) {
     );
   }
   for (const [logName, days] of policies) {
-    await rotateOperationalLog(logName, runDate, result);
     await cleanupFlatFiles({
       directory: config.logsDirectory,
       days,
@@ -1462,6 +1716,35 @@ async function cleanupOperationalLogs(runDate, result) {
       protectedDates: new Set(),
     });
   }
+}
+
+async function rotateDailyOperationalLogs(runDate) {
+  if (schedulerState.lastLogRotationDateKst === runDate) return;
+  const result = {
+    operationalLogs: {
+      rotatedFiles: 0,
+      sourceBytes: 0,
+      archiveBytes: 0,
+      files: 0,
+      bytes: 0,
+    },
+    errors: [],
+  };
+  const names = new Set(["web.log"]);
+  for (const channel of runtimeSettings.channels) {
+    names.add(channel.recorderLogName);
+  }
+  const archiveDate = previousDate(runDate);
+  for (const name of names) {
+    await rotateOperationalLog(name, archiveDate, result);
+  }
+  schedulerState.lastLogRotationDateKst = runDate;
+  await saveSchedulerState();
+  console.log(
+    `일별 로그 회전 완료: 날짜=${archiveDate}, ` +
+      `파일=${result.operationalLogs.rotatedFiles}, 오류=${result.errors.length}`,
+  );
+  for (const error of result.errors) console.error(error);
 }
 
 function escapeRegExp(value) {
@@ -1483,6 +1766,7 @@ async function runScheduledCleanup(runDateKst) {
     programAudio: { directories: 0 },
     schedules: { files: 0, bytes: 0 },
     reports: { files: 0, bytes: 0 },
+    reportLogs: { files: 0, bytes: 0 },
     operationalLogs: {
       rotatedFiles: 0,
       sourceBytes: 0,
@@ -1513,7 +1797,7 @@ async function runScheduledCleanup(runDateKst) {
       days,
       runDate: runDateKst,
       pattern:
-        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}(?:_part\d+)?(?:\.wav|\.timing\.csv)$/,
+        /^(\d{4}-\d{2}-\d{2})_\d{2}\.\d{2}\.\d{2}(?:_part\d+)?\.wav$/,
       category: "recordingWav",
       result,
       protectedDates,
@@ -1565,6 +1849,15 @@ async function runScheduledCleanup(runDateKst) {
       result,
       protectedDates,
     });
+    await cleanupFlatFiles({
+      directory: join(config.reportLogsDirectory, channel.id),
+      days: channel.retention.reportLogsDays,
+      runDate: runDateKst,
+      pattern: /^(\d{4}-\d{2}-\d{2})\.log$/,
+      category: "reportLogs",
+      result,
+      protectedDates,
+    });
   }
   await cleanupOperationalLogs(runDateKst, result);
   if (result.errors.length > 100) {
@@ -1584,6 +1877,7 @@ async function runScheduledCleanup(runDateKst) {
       `편성 오디오 ${result.programAudio.directories}일, ` +
       `편성표 ${result.schedules.files}개, ` +
       `리포트 ${result.reports.files}개, ` +
+      `리포트 로그 ${result.reportLogs.files}개, ` +
       `로그 압축 ${result.operationalLogs.rotatedFiles}개, ` +
       `오류 ${result.errors.length}개`,
   );
@@ -1664,14 +1958,18 @@ async function runScheduledReports(runDateKst, broadcastDate) {
 }
 
 async function checkReportSchedule() {
-  if (schedulerBusy || !runtimeSettings.reportSchedule.enabled) return;
-  const now = kstNowParts();
-  if (now.time < runtimeSettings.reportSchedule.timeKst) return;
-  const cleanupDue = schedulerState.lastCleanupDateKst !== now.date;
-  const reportDue = schedulerState.lastAttemptDateKst !== now.date;
-  if (!cleanupDue && !reportDue) return;
+  if (schedulerBusy) return;
   schedulerBusy = true;
   try {
+    const now = kstNowParts();
+    await rotateDailyOperationalLogs(now.date);
+    if (now.time < runtimeSettings.reportSchedule.timeKst) {
+      return;
+    }
+    const cleanupDue = schedulerState.lastCleanupDateKst !== now.date;
+    const reportDue = runtimeSettings.reportSchedule.enabled &&
+      schedulerState.lastAttemptDateKst !== now.date;
+    if (!cleanupDue && !reportDue) return;
     if (cleanupDue) await runScheduledCleanup(now.date);
     if (reportDue) {
       await runScheduledReports(now.date, previousDate(now.date));
@@ -2109,6 +2407,31 @@ async function route(request, response) {
     const channel = requireChannel(url.searchParams.get("channelId"), true);
     const date = requireDate(url.searchParams.get("date"));
     return sendJson(response, 200, await readReportData(channel, date));
+  }
+  if (request.method === "GET" && pathname === "/api/logs/index") {
+    const channel = requireChannel(url.searchParams.get("channelId"));
+    return sendJson(response, 200, {
+      channelId: channel.id,
+      dates: await logArchiveIndex(channel),
+    });
+  }
+  if (request.method === "GET" && pathname === "/api/logs/content") {
+    const channel = requireChannel(url.searchParams.get("channelId"));
+    const date = requireDate(url.searchParams.get("date"));
+    const type = String(url.searchParams.get("type") || "recorder");
+    if (!["recorder", "report"].includes(type)) {
+      throw httpError(400, "올바르지 않은 로그 종류입니다.");
+    }
+    const raw = type === "recorder"
+      ? await recorderLogContent(channel, date)
+      : await reportLogContent(channel, date);
+    return sendJson(response, 200, {
+      channelId: channel.id,
+      channelName: channel.name,
+      date,
+      type,
+      ...limitedLogContent(raw),
+    });
   }
   if (request.method === "GET" && pathname === "/api/program-audio") {
     const channel = requireChannel(url.searchParams.get("channelId"), true);

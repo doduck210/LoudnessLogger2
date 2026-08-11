@@ -15,7 +15,8 @@ sample을 임의로 빼지 않고, 서버 정시를 처음 통과하는 sample�
 - 한 시간 파일의 sample 수는 장치 clock 차이만큼 몇 frame 달라질 수 있다.
 - M-LKFS의 400 ms window와 100 ms hop은 원본 sample 기준으로 계속 일정하다.
 - 각 M-LKFS 행에는 해당 sample block의 보정된 서버 시각이 기록된다.
-- WAV 옆의 `.timing.csv`를 이용해 편성 오디오도 서버 시각 기준으로 자른다.
+- 편성 오디오는 WAV 파일명의 서버 시작시각과 실제 sample 수를 이용해 자른다.
+- WAV와 M-LKFS 파일은 포트 경로 아래 `YYYY-MM-DD` KST 날짜 폴더에 모인다.
 
 종료 로그의 `hardware_timestamps`가 `audio_packets`와 비슷하고
 `Server clock: locked=yes`이면 hardware 기준 시각 보정이 동작한 것이다.

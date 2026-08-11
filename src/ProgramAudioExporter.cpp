@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -93,64 +94,6 @@ std::optional<std::int64_t> filenameStartNanoseconds(
     return utcSeconds * 1000000000LL;
 }
 
-std::optional<std::int64_t> parseKstTimestampNanoseconds(
-    const std::string& timestamp) {
-    if (timestamp.size() < 19) return std::nullopt;
-    std::string base = timestamp.substr(0, 19);
-    std::replace(base.begin(), base.end(), 'T', ' ');
-    std::tm value{};
-    std::istringstream parser(base);
-    parser >> std::get_time(&value, "%Y-%m-%d %H:%M:%S");
-    if (!parser) return std::nullopt;
-    const std::time_t localAsUtc = timegm(&value);
-    if (localAsUtc == static_cast<std::time_t>(-1)) return std::nullopt;
-    std::int64_t nanoseconds = 0;
-    if (timestamp.size() > 20 && timestamp[19] == '.') {
-        std::size_t position = 20;
-        int digits = 0;
-        while (position < timestamp.size() &&
-               std::isdigit(static_cast<unsigned char>(timestamp[position])) &&
-               digits < 9) {
-            nanoseconds = nanoseconds * 10 + (timestamp[position] - '0');
-            ++position;
-            ++digits;
-        }
-        while (digits++ < 9) nanoseconds *= 10;
-    }
-    return (static_cast<std::int64_t>(localAsUtc) -
-            kSeoulUtcOffsetSeconds) * 1000000000LL + nanoseconds;
-}
-
-std::optional<std::pair<std::int64_t, std::int64_t>> timingInterval(
-    const std::filesystem::path& wavPath) {
-    std::filesystem::path timingPath = wavPath;
-    timingPath.replace_extension(".timing.csv");
-    std::ifstream input(timingPath);
-    std::string header;
-    std::string row;
-    if (!input || !std::getline(input, header) || !std::getline(input, row)) {
-        return std::nullopt;
-    }
-    const std::size_t firstComma = row.find(',');
-    const std::size_t secondComma =
-        firstComma == std::string::npos
-            ? std::string::npos
-            : row.find(',', firstComma + 1);
-    if (firstComma == std::string::npos || secondComma == std::string::npos) {
-        throw std::runtime_error("Invalid WAV timing metadata: " +
-                                 timingPath.string());
-    }
-    const auto start = parseKstTimestampNanoseconds(
-        row.substr(0, firstComma));
-    const auto end = parseKstTimestampNanoseconds(
-        row.substr(firstComma + 1, secondComma - firstComma - 1));
-    if (!start || !end || *end <= *start) {
-        throw std::runtime_error("Invalid WAV timing interval: " +
-                                 timingPath.string());
-    }
-    return std::make_pair(*start, *end);
-}
-
 WavSource readWavSource(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) {
@@ -200,10 +143,7 @@ WavSource readWavSource(const std::filesystem::path& path) {
         source.blockAlign == 0 || source.channels == 0) {
         throw std::runtime_error("Incomplete WAV header: " + path.string());
     }
-    const auto interval = timingInterval(path);
-    auto start = interval
-        ? std::optional<std::int64_t>(interval->first)
-        : filenameStartNanoseconds(path);
+    const auto start = filenameStartNanoseconds(path);
     if (!start) {
         throw std::runtime_error(
             "WAV filename does not contain a Seoul start time: " +
@@ -222,11 +162,10 @@ WavSource readWavSource(const std::filesystem::path& path) {
                      std::numeric_limits<std::int64_t>::max())) {
         throw std::runtime_error("WAV is too large: " + path.string());
     }
-    source.endNanoseconds = interval
-        ? interval->second
-        : source.startNanoseconds + static_cast<std::int64_t>(
-              (static_cast<long double>(frames) * 1000000000.0L) /
-              static_cast<long double>(source.sampleRate));
+    source.endNanoseconds =
+        source.startNanoseconds + static_cast<std::int64_t>(
+            (static_cast<long double>(frames) * 1000000000.0L) /
+            static_cast<long double>(source.sampleRate));
     return source;
 }
 
@@ -239,7 +178,7 @@ std::vector<WavSource> loadSources(
     }
     std::vector<WavSource> sources;
     for (const auto& entry :
-         std::filesystem::directory_iterator(recordingsDirectory)) {
+         std::filesystem::recursive_directory_iterator(recordingsDirectory)) {
         if (!entry.is_regular_file() ||
             entry.path().extension() != ".wav") {
             continue;
@@ -253,6 +192,20 @@ std::vector<WavSource> loadSources(
                   }
                   return left.path < right.path;
               });
+    // Completed adjacent files share an exact server-time boundary. Use the
+    // next filename as that boundary so a small DeckLink/server clock
+    // difference cannot create a gap during programme audio extraction.
+    constexpr std::int64_t kBoundaryToleranceNanoseconds = 2'000'000'000LL;
+    for (std::size_t index = 0; index + 1 < sources.size(); ++index) {
+        WavSource& current = sources[index];
+        const WavSource& next = sources[index + 1];
+        const std::int64_t difference =
+            next.startNanoseconds - current.endNanoseconds;
+        if (next.startNanoseconds > current.startNanoseconds &&
+            std::llabs(difference) <= kBoundaryToleranceNanoseconds) {
+            current.endNanoseconds = next.startNanoseconds;
+        }
+    }
     return sources;
 }
 
@@ -381,7 +334,7 @@ void copyClip(const std::vector<WavSource>& sources,
         const std::int64_t firstFrame = frameAtWallTime(*source, cursor);
         const std::int64_t lastFrame = frameAtWallTime(*source, spanEnd);
         if (lastFrame <= firstFrame) {
-            throw std::runtime_error("Invalid zero-length WAV timing span: " +
+            throw std::runtime_error("Invalid zero-length WAV interval: " +
                                      source->path.string());
         }
         spans.push_back({source, firstFrame, lastFrame - firstFrame});

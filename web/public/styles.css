@@ -432,6 +432,14 @@ pre.audio-job-log { max-height: 240px; min-height: 100px; margin: 0; }
 .report-card .file-icon { display: grid; place-items: center; width: 35px; height: 42px; margin-bottom: 22px; color: var(--good); background: #37d6a214; border: 1px solid #37d6a240; }
 .report-card strong { display: block; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .report-card small { display: block; margin: 7px 0 16px; color: var(--muted); }
+.log-toolbar { justify-content: flex-start; }
+.log-toolbar label { min-width: 190px; }
+.log-toolbar .toolbar-actions { margin-left: auto; align-self: end; }
+.log-viewer-panel { padding-bottom: 22px; }
+pre.log-viewer-content {
+  max-height: calc(100vh - 285px); min-height: 440px;
+  color: #bec9d3; white-space: pre; overflow: auto;
+}
 .global-message { padding: 8px 12px; border-radius: 5px; font-size: 11px; }
 .global-message.success {
   color: var(--notice-success-text); background: var(--notice-success-bg);
